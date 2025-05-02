@@ -27,6 +27,7 @@ sample_rate = 44100
 model_half = True
 model_instances = {}
 active_model_idx = 0
+output_directory = os.getcwd()  # Default to current directory
 
 bracketing_model_copies = {}  # format: {count: [model_copies]}
 active_bracketing_count = 0   # track currently allocated number of copies
@@ -73,10 +74,19 @@ def generate_with_model(specific_model, model_config, prompt, negative_prompt=No
     else:
         negative_conditioning = None
     
-    # Setup seed
+    # Setup seed for reproducibility
     seed = int(seed)
     if seed == -1:
+        # This should now be handled in generate_parallel for consistent random seeds
         seed = np.random.randint(0, 2**32 - 1, dtype=np.uint32)
+    
+    # Ensure deterministic results by setting global seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    print(f"Using seed: {seed}")
     
     # Extract specific generation parameters
     sampler_type = kwargs.pop("sampler_type", "dpmpp-3m-sde")
@@ -141,14 +151,16 @@ def generate_with_model(specific_model, model_config, prompt, negative_prompt=No
     audio = rearrange(audio, "b d n -> d (b n)")
     audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
     
-    # Save file
+    # Save file to the output directory
     filename = f"output_model_{np.random.randint(10000)}.wav"
-    torchaudio.save(filename, audio, temp_sample_rate)
+    filepath = os.path.join(output_directory, filename)
+    print(f"Saving parallel generation to: {filepath}")
+    torchaudio.save(filepath, audio, temp_sample_rate)
     
     # Create spectrogram
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=temp_sample_rate)
     
-    return filename, [(audio_spectrogram, f"Model result for: {prompt}")]
+    return filepath, [(audio_spectrogram, f"Model result for: {prompt}")]
 
 def generate_cond(
         prompt,
@@ -352,6 +364,9 @@ def generate_cond(
 
         audio = generate_diffusion_cond_inpaint(**generate_args)
 
+    # Use global output directory
+    global output_directory
+    
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt) 
     if file_naming=="verbose":
@@ -370,8 +385,10 @@ def generate_cond(
         filename_extension = file_format.split(" ")[0].lower()
     else: 
         filename_extension = "wav"
-    output_filename = "%s.%s" % (basename, filename_extension)
-    output_wav = "%s.wav" % basename
+    
+    # Use the output directory for file paths
+    output_filename = os.path.join(output_directory, f"{basename}.{filename_extension}")
+    output_wav = os.path.join(output_directory, f"{basename}.wav")
 
     # Cut the extra silence off the end, if the user requested a smaller seconds_total
     if cut_to_seconds_total:
@@ -382,6 +399,7 @@ def generate_cond(
     audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
 
     # save as wav file
+    print(f"Saving audio to: {output_wav}")
     torchaudio.save(output_wav, audio, sample_rate)
 
     # If file_format is other than wav, convert to other file format
@@ -408,12 +426,9 @@ def generate_cond(
     # Let's look at a nice spectrogram too
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
 
-    # Asynchronously delete the files after returning the output file, so as to prevent clutter in the directory
-    if file_naming in ["verbose", "prompt"]:
-        delete_files_async([output_wav, output_filename], 30)
-
+    # Return the full path to the files
     return (output_filename, [audio_spectrogram, *preview_images])
-
+    
 # Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
 def delete_files_async(filenames, delay):
     def delete_files_after_delay(filenames, delay):
