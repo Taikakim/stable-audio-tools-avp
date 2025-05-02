@@ -1,4 +1,7 @@
 # stable-audio-tools
+
+** This is a mostly personal fork to keep track of my changes and simplify my Colab workflow **
+
 Training and inference code for audio generation models
 
 # Install
