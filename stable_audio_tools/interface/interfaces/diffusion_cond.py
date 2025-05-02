@@ -15,18 +15,22 @@ from torch.nn import functional as F
 from torchaudio import transforms as T
 
 from ..aeiou import audio_spectrogram_image
-from ...inference.generation import generate_diffusion_cond, generate_diffusion_cond_inpaint #, generate_diffusion_uncond
-#from ..models.factory import create_model_from_config
-#from ..models.pretrained import get_pretrained_model
-#from ..models.utils import load_ckpt_state_dict
-from ...inference.utils import prepare_audio
-#from ..training.utils import copy_state_dict
+from ...inference.generation import generate_diffusion_cond
 
+from ...models.factory import create_model_from_config
+
+# Global variables for model management
 model = None
 model_type = None
 sample_size = 2097152
 sample_rate = 44100
 model_half = True
+model_instances = {}
+active_model_idx = 0
+
+bracketing_model_copies = {}  # format: {count: [model_copies]}
+active_bracketing_count = 0   # track currently allocated number of copies
+last_active_model_idx = None  # track which model was used for copies
 
 # when using a prompt in a filename
 def condense_prompt(prompt):
@@ -40,17 +44,123 @@ def condense_prompt(prompt):
         prompt = "_"
     return prompt
 
+def generate_with_model(specific_model, model_config, prompt, negative_prompt=None, steps=100, cfg_scale=7.0, seed=-1, **kwargs):
+    """Generate audio with a specific model - used for parallel generation"""
+    device = next(specific_model.parameters()).device
+    temp_sample_rate = model_config["sample_rate"]
+    temp_sample_size = model_config["sample_size"]
+    temp_model_type = model_config["model_type"]
+    
+    # Extract seconds parameters for conditioning
+    seconds_start = kwargs.pop("seconds_start", 0)
+    seconds_total = kwargs.pop("seconds_total", temp_sample_size // temp_sample_rate)
+    
+    # Basic validation
+    if temp_model_type not in ["diffusion_cond", "diffusion_cond_inpaint"]:
+        return None, [(None, f"Model type {temp_model_type} not supported for conditional generation")]
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Create conditioning with seconds parameters
+    conditioning_dict = {"prompt": prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}
+    conditioning = [conditioning_dict]
+    
+    if negative_prompt:
+        negative_conditioning_dict = {"prompt": negative_prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}
+        negative_conditioning = [negative_conditioning_dict]
+    else:
+        negative_conditioning = None
+    
+    # Setup seed
+    seed = int(seed)
+    if seed == -1:
+        seed = np.random.randint(0, 2**32 - 1, dtype=np.uint32)
+    
+    # Extract specific generation parameters
+    sampler_type = kwargs.pop("sampler_type", "dpmpp-3m-sde")
+    sigma_min = kwargs.pop("sigma_min", 0.03)
+    sigma_max = kwargs.pop("sigma_max", 100)
+    cfg_interval = kwargs.pop("cfg_interval", (0.0, 1.0))
+    cfg_rescale = kwargs.pop("cfg_rescale", 0.0)
+    rho = kwargs.pop("rho", 1.0)
+    
+    # Generate arguments with only the parameters expected by generate_diffusion_cond
+    generate_args = {
+        "model": specific_model,
+        "conditioning": conditioning,
+        "negative_conditioning": negative_conditioning,
+        "steps": steps,
+        "cfg_scale": cfg_scale,
+        "cfg_interval": cfg_interval,
+        "batch_size": 1,
+        "sample_size": temp_sample_size,
+        "seed": seed,
+        "device": device,
+        "sampler_type": sampler_type,
+        "sigma_min": sigma_min,
+        "sigma_max": sigma_max,
+        "scale_phi": cfg_rescale,
+        "rho": rho
+    }
+    
+    # Add other valid parameters
+    init_audio = kwargs.pop("init_audio", None)
+    if init_audio is not None:
+        generate_args["init_audio"] = init_audio
+        
+    init_noise_level = kwargs.pop("init_noise_level", 1.0)
+    generate_args["init_noise_level"] = init_noise_level
+    
+    # Handle inpainting parameters if needed
+    if temp_model_type == "diffusion_cond_inpaint":
+        inpaint_audio = kwargs.pop("inpaint_audio", None)
+        if inpaint_audio is not None:
+            mask_start = kwargs.pop("mask_maskstart", 0)
+            mask_end = kwargs.pop("mask_maskend", temp_sample_size // temp_sample_rate)
+            
+            # Convert to sample indices
+            mask_start_samples = int(mask_start * temp_sample_rate)
+            mask_end_samples = int(mask_end * temp_sample_rate)
+            
+            # Create mask
+            inpaint_mask = torch.ones(1, temp_sample_size, device=device)
+            inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
+            
+            generate_args["inpaint_audio"] = inpaint_audio
+            generate_args["inpaint_mask"] = inpaint_mask
+    
+    # Generate audio
+    if temp_model_type == "diffusion_cond":
+        audio = generate_diffusion_cond(**generate_args)
+    elif temp_model_type == "diffusion_cond_inpaint":
+        audio = generate_diffusion_cond_inpaint(**generate_args)
+    
+    # Process output
+    audio = rearrange(audio, "b d n -> d (b n)")
+    audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
+    
+    # Save file
+    filename = f"output_model_{np.random.randint(10000)}.wav"
+    torchaudio.save(filename, audio, temp_sample_rate)
+    
+    # Create spectrogram
+    audio_spectrogram = audio_spectrogram_image(audio, sample_rate=temp_sample_rate)
+    
+    return filename, [(audio_spectrogram, f"Model result for: {prompt}")]
+
 def generate_cond(
         prompt,
         negative_prompt=None,
         seconds_start=0,
-        seconds_total=30,
-        cfg_scale=6.0,
-        steps=250,
+        seconds_total=48,
+        cfg_scale=7.0,
+        steps=100,
         preview_every=None,
         seed=-1,
         sampler_type="dpmpp-3m-sde",
-        sigma_min=0.03,
+        sigma_min=0.01,
         sigma_max=1000,
         rho=1.0,
         cfg_interval_min=0.0,
@@ -66,6 +176,23 @@ def generate_cond(
         inpaint_audio=None,
         batch_size=1    
     ):
+
+    global model_instances, active_model_idx, model, model_type, sample_rate, sample_size
+
+     # Explicitly get the active model and update all globals
+    if active_model_idx in model_instances:
+        model = model_instances[active_model_idx]["model"]
+        model_config = model_instances[active_model_idx]["config"] 
+        model_type = model_config["model_type"]
+        sample_rate = model_config["sample_rate"]
+        sample_size = model_config["sample_size"]
+        print(f"Generating with model in slot {active_model_idx+1}: {model_type}")
+    else:
+        return "No active model available", None
+    
+    # Check if the model type is appropriate for this function
+    if model_type not in ["diffusion_cond", "diffusion_cond_inpaint"]:
+        return f"Active model is type {model_type}, but this function requires a conditional diffusion model", None
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -90,7 +217,7 @@ def generate_cond(
     else:
         negative_conditioning = None
         
-    #Get the device from the model
+    # Get the device from the model
     device = next(model.parameters()).device
 
     seed = int(seed)
@@ -127,8 +254,6 @@ def generate_cond(
         audio_length = init_audio.shape[-1]
 
         if audio_length > sample_size:
-
-            #input_sample_size = audio_length + (model.min_input_length - (audio_length % model.min_input_length)) % model.min_input_length
             init_audio = init_audio[:, :sample_size]
 
         init_audio = (sample_rate, init_audio)
@@ -160,8 +285,6 @@ def generate_cond(
         audio_length = inpaint_audio.shape[-1]
 
         if audio_length > sample_size:
-
-            #input_sample_size = audio_length + (model.min_input_length - (audio_length % model.min_input_length)) % model.min_input_length
             inpaint_audio = inpaint_audio[:, :sample_size]
 
         inpaint_audio = (sample_rate, inpaint_audio)
@@ -180,13 +303,19 @@ def generate_cond(
             audio_spectrogram = audio_spectrogram_image(denoised, sample_rate=sample_rate)
             preview_images.append((audio_spectrogram, f"Step {current_step} sigma={sigma:.3f})"))
 
+    # Handle cfg_interval - could be individual parameters or a tuple
+    cfg_interval_to_use = (cfg_interval_min, cfg_interval_max)
+    if isinstance(cfg_interval_min, tuple) and len(cfg_interval_min) == 2:
+        # First arg is already a tuple
+        cfg_interval_to_use = cfg_interval_min
+        
     generate_args = {
         "model": model,
         "conditioning": conditioning,
         "negative_conditioning": negative_conditioning,
         "steps": steps,
         "cfg_scale": cfg_scale,
-        "cfg_interval": (cfg_interval_min, cfg_interval_max),
+        "cfg_interval": cfg_interval_to_use,  # Using the tuple
         "batch_size": batch_size,
         "sample_size": input_sample_size,
         "seed": seed,
@@ -201,15 +330,13 @@ def generate_cond(
         "rho": rho
     }
 
-     # If inpainting, send mask args
+    # If inpainting, send mask args
     # This will definitely change in the future
     if model_type == "diffusion_cond":
-
         # Do the audio generation
         audio = generate_diffusion_cond(**generate_args)
 
     elif model_type == "diffusion_cond_inpaint":
-
         if inpaint_audio is not None:
             # Convert mask start and end from percentages to sample indices
             mask_start = int(mask_maskstart * sample_rate)
@@ -287,7 +414,7 @@ def generate_cond(
 
     return (output_filename, [audio_spectrogram, *preview_images])
 
-#  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
+# Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
 def delete_files_async(filenames, delay):
     def delete_files_after_delay(filenames, delay):
         time.sleep(delay)  # Wait for the specified delay
@@ -297,7 +424,9 @@ def delete_files_async(filenames, delay):
     threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start() 
 
 def create_sampling_ui(model_config):
-    has_inpainting = model_config["model_type"] == "diffusion_cond_inpaint"
+    global model, model_type, sample_size, sample_rate
+    
+    has_inpainting = model_type == "diffusion_cond_inpaint"
     
     model_conditioning_config = model_config["model"].get("conditioning", None)
 
@@ -314,6 +443,36 @@ def create_sampling_ui(model_config):
                 has_seconds_start = True
             if conditioning_config["id"] == "seconds_total":
                 has_seconds_total = True
+                
+# Add bracketing controls in an accordion
+
+    with gr.Accordion("Parameter Bracketing", open=False):
+        with gr.Row():
+            bracket_count = gr.Slider(minimum=0, maximum=16, step=1, value=0, 
+                                    label="Number of Variations (0 for single generation)")
+        
+        with gr.Column():
+            with gr.Row():
+                bracket_steps = gr.Number(value=0, label="Steps Increment", precision=0)
+                bracket_cfg = gr.Number(value=0.0, label="CFG Scale Increment", precision=2)
+            
+            with gr.Row():
+                bracket_seed = gr.Number(value=0, label="Seed Increment", precision=0)
+                bracket_noise = gr.Number(value=0.0, label="Noise Level Increment", precision=2)
+            
+            with gr.Row():
+                bracket_cfg_rescale = gr.Number(value=0.0, label="CFG Rescale Increment", precision=2)
+                bracket_sigma_min = gr.Number(value=0.0, label="Sigma Min Increment", precision=3)
+            
+            with gr.Row():
+                bracket_sigma_max = gr.Number(value=0.0, label="Sigma Max Increment", precision=1)
+                bracket_rho = gr.Number(value=0.0, label="Rho Increment", precision=2)
+            
+            bracket_warning = gr.Markdown(
+                "⚠️ **Note**: Bracketing creates multiple variations with increasing parameter values. "
+                "Results will appear as separate audio players below.", 
+                visible=True
+            )
 
     with gr.Row():
         with gr.Column(scale=6):
@@ -362,8 +521,8 @@ def create_sampling_ui(model_config):
             with gr.Accordion("Output params", open=False):
                 # Output params
                 with gr.Row():
-                    file_format_dropdown = gr.Dropdown(["wav", "flac", "mp3 320k", "mp3 v0", "mp3 128k", "m4a aac_he_v2 64k", "m4a aac_he_v2 32k"], label="File format", value="wav")
-                    file_naming_dropdown = gr.Dropdown(["verbose", "prompt", "output.wav"], label="File naming", value="output.wav")
+                    file_format_dropdown = gr.Dropdown(["wav", "flac", "mp3 320k", "mp3 v0", "mp3 128k", "m4a aac_he_v2 64k", "m4a aac_he_v2 32k"], label="File format", value="mp3 320k")
+                    file_naming_dropdown = gr.Dropdown(["verbose", "prompt", "output.wav"], label="File naming", value="prompt")
                     cut_to_seconds_total_checkbox = gr.Checkbox(label="Cut to seconds total", value=True)
                     preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Spec Preview Every N Steps")
                     
@@ -402,7 +561,16 @@ def create_sampling_ui(model_config):
                 init_noise_level_slider,
                 mask_maskstart_slider,
                 mask_maskend_slider,
-                inpaint_audio_input
+                inpaint_audio_input,
+                bracket_count, 
+                bracket_steps, 
+                bracket_cfg,
+                bracket_noise, 
+                bracket_cfg_rescale,
+                bracket_seed,
+                bracket_sigma_min,
+                bracket_sigma_max,
+                bracket_rho
             ]
 
         with gr.Column():
@@ -414,24 +582,326 @@ def create_sampling_ui(model_config):
             if has_inpainting:
                 send_to_inpaint_button = gr.Button("Send to inpaint audio", scale=1)
                 send_to_inpaint_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[inpaint_audio_input])
+                    
+        # Add container for bracketed results (initially hidden)
+        with gr.Column(visible=False) as bracketed_container:
+            bracketed_gallery = gr.Gallery(label="Parameter Variations")
+            
+            # Create placeholders for dynamic audio players
+            bracketed_audio_players = []
+            for i in range(16):  # Max 16 variations
+                audio_player = gr.Audio(label=f"Variation {i+1}", visible=False)
+                bracketed_audio_players.append(audio_player)
     
-    generate_button.click(fn=generate_cond, 
+    generate_button.click(
+        fn=generate_with_bracketing,
         inputs=inputs,
         outputs=[
-            audio_output, 
-            audio_spectrogram_output
-        ], 
-        api_name="generate")
+            audio_output, audio_spectrogram_output,
+            bracketed_container, bracketed_gallery,
+            *bracketed_audio_players
+        ]
+    )
 
+def generate_with_bracketing(
+        prompt, negative_prompt, seconds_start, seconds_total, 
+        cfg_scale, steps, preview_every, seed, sampler_type,
+        sigma_min, sigma_max, rho, cfg_interval_min, cfg_interval_max,
+        cfg_rescale, file_format, file_naming, cut_to_seconds_total,
+        init_audio, init_noise_level, mask_maskstart, mask_maskend,
+        inpaint_audio, bracket_count, bracket_steps, bracket_cfg,
+        bracket_noise, bracket_cfg_rescale, bracket_seed, bracket_sigma_min,
+        bracket_sigma_max, bracket_rho
+    ):
+    """Generate audio with parameter bracketing using discrete model copies for true parallelism"""
+    global model_instances, active_model_idx, bracketing_model_copies, active_bracketing_count, last_active_model_idx
+    
+    try:
+        # Convert parameters to appropriate types
+        try:
+            steps = int(steps)
+            cfg_scale = float(cfg_scale)
+            seed = int(seed) if seed != "-1" else -1
+            sigma_min = float(sigma_min)
+            sigma_max = float(sigma_max)
+            rho = float(rho)
+            cfg_rescale = float(cfg_rescale)
+            init_noise_level = float(init_noise_level)
+            
+            # Convert bracketing parameters
+            bracket_count = int(bracket_count) if bracket_count not in [None, ""] else 0
+            bracket_steps = int(bracket_steps) if bracket_steps not in [None, ""] else 0
+            bracket_cfg = float(bracket_cfg) if bracket_cfg not in [None, ""] else 0.0
+            bracket_seed = int(bracket_seed) if bracket_seed not in [None, ""] else 0
+            bracket_noise = float(bracket_noise) if bracket_noise not in [None, ""] else 0.0
+            bracket_cfg_rescale = float(bracket_cfg_rescale) if bracket_cfg_rescale not in [None, ""] else 0.0
+            bracket_sigma_min = float(bracket_sigma_min) if bracket_sigma_min not in [None, ""] else 0.0
+            bracket_sigma_max = float(bracket_sigma_max) if bracket_sigma_max not in [None, ""] else 0.0
+            bracket_rho = float(bracket_rho) if bracket_rho not in [None, ""] else 0.0
+        except (ValueError, TypeError) as e:
+            print(f"Error converting parameters: {e}")
+            # Use default values if conversion fails
+            if 'bracket_count' not in locals(): bracket_count = 0
+            if 'bracket_steps' not in locals(): bracket_steps = 0
+            if 'bracket_cfg' not in locals(): bracket_cfg = 0.0
+            if 'bracket_seed' not in locals(): bracket_seed = 0
+            if 'bracket_noise' not in locals(): bracket_noise = 0.0
+            if 'bracket_cfg_rescale' not in locals(): bracket_cfg_rescale = 0.0
+            if 'bracket_sigma_min' not in locals(): bracket_sigma_min = 0.0
+            if 'bracket_sigma_max' not in locals(): bracket_sigma_max = 0.0
+            if 'bracket_rho' not in locals(): bracket_rho = 0.0
+        
+        # Check if bracketing is enabled
+        is_bracketing = (bracket_count > 0 and 
+                       (bracket_steps != 0 or bracket_cfg != 0 or bracket_seed != 0 or
+                        bracket_noise != 0 or bracket_cfg_rescale != 0 or
+                        bracket_sigma_min != 0 or bracket_sigma_max != 0 or bracket_rho != 0))
+        
+        print(f"Bracketing enabled: {is_bracketing}")
+        
+        if not is_bracketing:
+            # Standard single generation
+            result = generate_cond(
+                prompt, negative_prompt, seconds_start, seconds_total,
+                cfg_scale, steps, preview_every, seed, sampler_type,
+                sigma_min, sigma_max, rho, cfg_interval_min, cfg_interval_max,
+                cfg_rescale, file_format, file_naming, cut_to_seconds_total,
+                init_audio, init_noise_level, mask_maskstart, mask_maskend,
+                inpaint_audio
+            )
+            return [result[0], result[1], gr.update(visible=False), None] + [None] * 16
+        
+        # Get the current active model and config
+        if active_model_idx not in model_instances:
+            return "No active model available", None, gr.update(visible=False), None, [None] * 16
+        
+        original_model = model_instances[active_model_idx]["model"]
+        model_config = model_instances[active_model_idx]["config"]
+        
+        # Determine device from parameters rather than model attribute
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+        
+        # Memory management: Let's start with a clean state
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"Memory after cleanup: {torch.cuda.memory_allocated() / (1024**3):.2f}GB / {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f}GB")
+        
+        # Let's do a sequential generation approach instead of parallel to avoid OOM issues
+        results = []
+        
+        # Print base values
+        print(f"Base values - Steps: {steps}, CFG: {cfg_scale}, Seed: {seed}, "
+              f"Noise: {init_noise_level}, Rescale: {cfg_rescale}, "
+              f"Sigma Min: {sigma_min}, Sigma Max: {sigma_max}, Rho: {rho}")
+        
+        # For each variation
+        for i in range(bracket_count):
+            var_idx = i + 1
+            
+            # Calculate parameter values for this variation with bounds checking
+            var_steps = max(1, min(steps + (bracket_steps * var_idx), 500))
+            var_cfg = max(0, min(cfg_scale + (bracket_cfg * var_idx), 25.0))
+            
+            # Handle seed specially
+            if seed == -1:
+                var_seed = -1  # Will generate a random seed in generate_cond
+            else:
+                var_seed = seed + (bracket_seed * var_idx)
+            
+            var_noise = max(0.01, min(init_noise_level + (bracket_noise * var_idx), 100.0))
+            var_rescale = max(-1.0, min(cfg_rescale + (bracket_cfg_rescale * var_idx), 1.0))
+            var_sigma_min = max(0.0, min(sigma_min + (bracket_sigma_min * var_idx), 2.0))
+            var_sigma_max = max(var_sigma_min, min(sigma_max + (bracket_sigma_max * var_idx), 1000.0))
+            var_rho = max(0.0, min(rho + (bracket_rho * var_idx), 10.0))
+            
+            # Print what we're generating for debugging
+            print(f"Variation {var_idx}: Steps={var_steps}, CFG={var_cfg}, Noise={var_noise}, " +
+                  f"SigMin={var_sigma_min}, SigMax={var_sigma_max}, Rho={var_rho}")
+            
+            # Create a unique base filename for this variation
+            timestamp = int(time.time() * 1000) % 10000
+            unique_basename = f"var{var_idx}_{timestamp}"
+            
+            # Call generate_cond sequentially (no threads or model copies)
+            try:
+                result = generate_cond(
+                    prompt=prompt, 
+                    negative_prompt=negative_prompt, 
+                    seconds_start=seconds_start, 
+                    seconds_total=seconds_total,
+                    cfg_scale=var_cfg, 
+                    steps=var_steps, 
+                    preview_every=preview_every, 
+                    seed=var_seed, 
+                    sampler_type=sampler_type,
+                    sigma_min=var_sigma_min, 
+                    sigma_max=var_sigma_max, 
+                    rho=var_rho, 
+                    cfg_interval_min=cfg_interval_min,
+                    cfg_interval_max=cfg_interval_max,
+                    cfg_rescale=var_rescale, 
+                    file_format=file_format, 
+                    file_naming=unique_basename, 
+                    cut_to_seconds_total=cut_to_seconds_total,
+                    init_audio=init_audio, 
+                    init_noise_level=var_noise, 
+                    mask_maskstart=mask_maskstart, 
+                    mask_maskend=mask_maskend,
+                    inpaint_audio=inpaint_audio
+                )
+                results.append((i, result))
+                
+                # Force memory cleanup after each generation
+                torch.cuda.empty_cache()
+                gc.collect()
+                print(f"Memory after variation {var_idx}: {torch.cuda.memory_allocated() / (1024**3):.2f}GB")
+                
+            except Exception as e:
+                print(f"Error generating variation {var_idx}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # Process results for the UI
+        gallery_items = []
+        audio_files = []
+        
+        for i, result in results:
+            if result:
+                audio_file, spectrograms = result
+                
+                # Store the audio file
+                audio_files.append(audio_file)
+                
+                # Create parameter variation label
+                var_idx = i + 1
+                var_steps = steps + (bracket_steps * var_idx)
+                var_cfg = cfg_scale + (bracket_cfg * var_idx)
+                var_seed = "random" if seed == -1 else seed + (bracket_seed * var_idx)
+                var_noise = init_noise_level + (bracket_noise * var_idx)
+                var_rescale = cfg_rescale + (bracket_cfg_rescale * var_idx)
+                var_sigma_min = sigma_min + (bracket_sigma_min * var_idx)
+                var_sigma_max = sigma_max + (bracket_sigma_max * var_idx)
+                var_rho = rho + (bracket_rho * var_idx)
+                
+                # Only show changed parameters in the label
+                label = f"Variation {var_idx}: "
+                if bracket_steps != 0:
+                    label += f"Steps={var_steps}, "
+                if bracket_cfg != 0:
+                    label += f"CFG={var_cfg:.1f}, "
+                if bracket_seed != 0 and seed != -1:
+                    label += f"Seed={var_seed}, "
+                if bracket_noise != 0:
+                    label += f"Noise={var_noise:.2f}, "
+                if bracket_cfg_rescale != 0:
+                    label += f"Rescale={var_rescale:.2f}, "
+                if bracket_sigma_min != 0:
+                    label += f"SigMin={var_sigma_min:.3f}, "
+                if bracket_sigma_max != 0:
+                    label += f"SigMax={var_sigma_max:.1f}, "
+                if bracket_rho != 0:
+                    label += f"Rho={var_rho:.2f}, "
+                label = label.rstrip(", ")
+                
+                # Handle spectrograms safely
+                if spectrograms:
+                    if isinstance(spectrograms, list) and spectrograms:
+                        first_item = spectrograms[0]
+                        # Handle different spectrogram formats
+                        if isinstance(first_item, tuple):
+                            gallery_items.append((first_item[0], label))
+                        else:
+                            gallery_items.append((first_item, label))
+                    else:
+                        gallery_items.append((spectrograms, label))
+        
+        # Debug the files we've generated
+        print(f"Generated {len(audio_files)} audio files")
+        
+        # Prepare outputs for the UI
+        std_audio = audio_files[0] if audio_files else None
+        std_gallery = results[0][1][1] if results else None
+        
+        # Update audio players for each variation
+        audio_updates = []
+        for i in range(16):
+            if i < len(audio_files) and audio_files[i]:
+                var_idx = i + 1
+                
+                # Create label for audio player
+                label = f"Variation {var_idx}: "
+                if bracket_steps != 0:
+                    label += f"Steps={steps + (bracket_steps * var_idx)}, "
+                if bracket_cfg != 0:
+                    label += f"CFG={cfg_scale + (bracket_cfg * var_idx):.1f}, "
+                if bracket_seed != 0 and seed != -1:
+                    label += f"Seed={seed + (bracket_seed * var_idx)}, "
+                if bracket_noise != 0:
+                    label += f"Noise={init_noise_level + (bracket_noise * var_idx):.2f}, "
+                if bracket_cfg_rescale != 0:
+                    label += f"Rescale={cfg_rescale + (bracket_cfg_rescale * var_idx):.2f}, "
+                if bracket_sigma_min != 0:
+                    label += f"SigMin={sigma_min + (bracket_sigma_min * var_idx):.3f}, "
+                if bracket_sigma_max != 0:
+                    label += f"SigMax={sigma_max + (bracket_sigma_max * var_idx):.1f}, "
+                if bracket_rho != 0:
+                    label += f"Rho={rho + (bracket_rho * var_idx):.2f}, "
+                label = label.rstrip(", ")
+                
+                audio_updates.append(gr.update(value=audio_files[i], visible=True, label=label))
+            else:
+                audio_updates.append(gr.update(visible=False))
+        
+        return [std_audio, std_gallery, gr.update(visible=True), gallery_items] + audio_updates
+    
+    except Exception as e:
+        print(f"Critical error in bracketing: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return ["Error: " + str(e), None, gr.update(visible=False), None] + [None] * 16
+
+def clear_bracketing_model_copies():
+    """Clears model copies to free VRAM"""
+    global bracketing_model_copies, active_bracketing_count, last_active_model_idx
+    
+    if active_bracketing_count > 0:
+        print(f"Clearing {active_bracketing_count} model copies to free VRAM")
+        
+        if active_bracketing_count in bracketing_model_copies:
+            for model_copy in bracketing_model_copies[active_bracketing_count]:
+                del model_copy
+            
+            bracketing_model_copies[active_bracketing_count] = []
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        active_bracketing_count = 0
+        last_active_model_idx = None
+        print("Model copies cleared")
 
 def create_diffusion_cond_ui(model_config, in_model, in_model_half=True):
-    global model, sample_size, sample_rate, model_type, model_half
+    global model, sample_size, sample_rate, model_type, model_half, model_instances, active_model_idx
 
-    model = in_model
+    # Store the model in the model_instances dictionary if it's not already there
+    if not model_instances:
+        model_instances[0] = {
+            "model": in_model,
+            "config": model_config,
+            "path": "initial_model",
+            "type": model_config["model_type"]
+        }
+        active_model_idx = 0
+
+    # Always use the active model directly
+    model = model_instances[active_model_idx]["model"] if active_model_idx in model_instances else in_model
+    model_config = model_instances[active_model_idx]["config"] if active_model_idx in model_instances else model_config
+    
     sample_size = model_config["sample_size"]
     sample_rate = model_config["sample_rate"]
     model_type = model_config["model_type"]
-
     model_half = in_model_half
 
     with gr.Blocks() as ui:
