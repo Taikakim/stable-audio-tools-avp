@@ -31,6 +31,7 @@ sample_rate = 32000
 sample_size = 1920000
 model_instances = {}
 active_model_idx = 0
+output_directory = os.getcwd()  # Default to current directory
 
 def find_config_for_checkpoint(ckpt_path, explicit_config_path=None):
     """Find the most appropriate config file for a checkpoint using various strategies"""
@@ -622,41 +623,45 @@ def load_model_slot(path, config_path=None, slot_index=0, model_half=True, pretr
                 return f"Error: {str(e)}", update_gpu_memory()
                 
             new_model, model_config = load_model(
-                model_config=config_to_use,
-                model_ckpt_path=path,
-                pretrained_name=None,
-                pretransform_ckpt_path=pretransform_path,
+                model_config=config_to_use, 
+                model_ckpt_path=path, 
+                pretrained_name=None, 
+                pretransform_ckpt_path=pretransform_path, 
                 model_half=model_half
             )
         else:
             # It's a pretrained name
             new_model, model_config = load_model(
-                model_config=None,
-                model_ckpt_path=None,
-                pretrained_name=path,
-                pretransform_ckpt_path=pretransform_path,
+                model_config=None, 
+                model_ckpt_path=None, 
+                pretrained_name=path, 
+                pretransform_ckpt_path=pretransform_path, 
                 model_half=model_half
             )
         
-        # Store the model
+        # Store the model with precision info
         model_instances[slot_index] = {
             "model": new_model,
             "config": model_config,
             "path": path,
-            "type": model_config["model_type"]
+            "type": model_config["model_type"],
+            "half_precision": model_half  # Store the precision setting
         }
         
         # Make this the active model if it's the first one loaded
         if active_model_idx not in model_instances:
             active_model_idx = slot_index
             model = new_model
-            return f"★ ACTIVE: {model_config['model_type']} ★", update_gpu_memory()
+            precision_text = "FP16" if model_half else "FP32"
+            return f"★ ACTIVE: {model_config['model_type']} ({precision_text}) ★", update_gpu_memory()
         elif active_model_idx == slot_index:
             # If we're reloading the active model, keep it active
             model = new_model
-            return f"★ ACTIVE: {model_config['model_type']} ★", update_gpu_memory()
+            precision_text = "FP16" if model_half else "FP32"
+            return f"★ ACTIVE: {model_config['model_type']} ({precision_text}) ★", update_gpu_memory()
         else:
-            return f"Loaded: {model_config['model_type']}", update_gpu_memory()
+            precision_text = "FP16" if model_half else "FP32"
+            return f"Loaded: {model_config['model_type']} ({precision_text})", update_gpu_memory()
         
     except Exception as e:
         return f"Error loading model in slot {slot_index+1}: {str(e)}", update_gpu_memory()
@@ -669,10 +674,11 @@ def set_active_model(slot_index):
     status_updates = []
     for i in range(6):
         if i in model_instances:
+            precision_text = "FP16" if model_instances[i].get('half_precision', False) else "FP32"
             if i == slot_index:
-                status_updates.append(f"★ ACTIVE: {model_instances[i]['type']} ★")
+                status_updates.append(f"★ ACTIVE: {model_instances[i]['type']} ({precision_text}) ★")
             else:
-                status_updates.append(f"Loaded: {model_instances[i]['type']}")
+                status_updates.append(f"Loaded: {model_instances[i]['type']} ({precision_text})")
         else:
             status_updates.append("Not loaded")
     
@@ -684,8 +690,9 @@ def set_active_model(slot_index):
         model_type = model_config["model_type"] 
         sample_rate = model_config["sample_rate"]
         sample_size = model_config["sample_size"]
-        print(f"Active model changed to slot {slot_index+1}, type: {model_type}")
-        message = f"Model {slot_index+1} is now active ({model_type})"
+        precision_text = "FP16" if model_instances[slot_index].get('half_precision', False) else "FP32"
+        print(f"Active model changed to slot {slot_index+1}, type: {model_type}, precision: {precision_text}")
+        message = f"Model {slot_index+1} is now active ({model_type}, {precision_text})"
     else:
         message = f"No model loaded in slot {slot_index+1}"
     
@@ -693,7 +700,12 @@ def set_active_model(slot_index):
 
 def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=True):
     """Creates the UI with compact model management capabilities"""
-    global model_instances, active_model_idx, model
+    global model_instances, active_model_idx, model, output_directory
+    
+    # Initialize output directory to current directory if not set
+    if 'output_directory' not in globals():
+        global output_directory
+        output_directory = os.getcwd()
     
     # Clean up pretransform path if it's empty
     if not pretransform_ckpt_path or pretransform_ckpt_path.strip() == "":
@@ -725,7 +737,8 @@ def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrai
                 "model": initial_model,
                 "config": initial_config,
                 "path": pretrained_name or ckpt_path,
-                "type": initial_config["model_type"]
+                "type": initial_config["model_type"],
+                "half_precision": model_half  # Store the precision setting
             }
             
             active_model_idx = 0
@@ -738,11 +751,43 @@ def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrai
         # Add a hidden textbox to hold extra status messages
         status_message = gr.Textbox(visible=False)
         
-        # Compact GPU memory display
+        # Compact GPU memory display and output directory setting
         with gr.Row():
-            gpu_memory = gr.Textbox(label="GPU Memory", value=update_gpu_memory())
-            refresh_btn = gr.Button("Refresh")
-            refresh_btn.click(fn=update_gpu_memory, inputs=[], outputs=[gpu_memory])
+            with gr.Column(scale=3):
+                gpu_memory = gr.Textbox(label="GPU Memory", value=update_gpu_memory())
+                refresh_btn = gr.Button("Refresh", size="sm")
+                refresh_btn.click(fn=update_gpu_memory, inputs=[], outputs=[gpu_memory])
+            
+            with gr.Column(scale=5):
+                output_dir_input = gr.Textbox(
+                    label="Output Directory", 
+                    value=output_directory,
+                    placeholder="/path/to/save/files"
+                )
+                
+                def set_output_directory(path):
+                    global output_directory
+                    if path and os.path.exists(path):
+                        output_directory = path
+                        return f"Output directory set to: {path}"
+                    elif not path:
+                        output_directory = os.getcwd()
+                        return f"Using current directory: {output_directory}"
+                    else:
+                        try:
+                            os.makedirs(path, exist_ok=True)
+                            output_directory = path
+                            return f"Created and set output directory to: {path}"
+                        except Exception as e:
+                            return f"Error setting directory: {str(e)}"
+                
+                set_dir_btn = gr.Button("Set Output Directory", size="sm")
+                dir_status = gr.Textbox(show_label=False, interactive=False)
+                set_dir_btn.click(
+                    fn=set_output_directory, 
+                    inputs=[output_dir_input], 
+                    outputs=[dir_status]
+                )
         
         # More compact model management section
         with gr.Accordion("Model Management", open=True):
@@ -750,17 +795,18 @@ def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrai
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("**Model**")
-                with gr.Column(scale=5):
+                with gr.Column(scale=4):
                     gr.Markdown("**Path/Name**")
                 with gr.Column(scale=3):
                     gr.Markdown("**Config**")
-                with gr.Column(scale=3):
+                with gr.Column(scale=4):
                     gr.Markdown("**Controls**")
                 with gr.Column(scale=2):
                     gr.Markdown("**Status**")
             
             # For tracking status boxes
             status_boxes = []
+            half_precision_checkboxes = []
             
             # Create compact model slots
             for i in range(6):
@@ -768,7 +814,7 @@ def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrai
                     with gr.Column(scale=1):
                         gr.Markdown(f"**#{i+1}**")
                     
-                    with gr.Column(scale=5):
+                    with gr.Column(scale=4):
                         model_path = gr.Textbox(
                             show_label=False,
                             placeholder="Model path or name",
@@ -790,23 +836,35 @@ def create_ui_with_model_manager(model_config_path=None, ckpt_path=None, pretrai
                                 value=pretransform_ckpt_path if i == 0 and pretransform_ckpt_path else ""
                             )
                     
-                    with gr.Column(scale=3):
+                    with gr.Column(scale=4):
                         with gr.Row():
                             load_btn = gr.Button("Load", variant="primary")
                             active_btn = gr.Button("Set Active", variant="secondary")
+                            half_precision = gr.Checkbox(label="Half Precision", value=model_half)
+                            half_precision_checkboxes.append(half_precision)
                     
                     with gr.Column(scale=2):
                         # Create status text directly in place
                         initial_status = "★ ACTIVE ★" if i == active_model_idx and i in model_instances else "Not loaded"
                         if i in model_instances and i != active_model_idx:
                             initial_status = f"Loaded: {model_instances[i]['type']}"
+                            if model_instances[i].get('half_precision', False):
+                                initial_status += " (FP16)"
+                            else:
+                                initial_status += " (FP32)"
                         status = gr.Textbox(show_label=False, value=initial_status)
                         status_boxes.append(status)
                     
                     # Connect the buttons
                     load_btn.click(
                         fn=load_model_slot,
-                        inputs=[model_path, config_path, gr.Number(value=i, visible=False), gr.Checkbox(value=model_half, visible=False), pretransform_path],
+                        inputs=[
+                            model_path, 
+                            config_path, 
+                            gr.Number(value=i, visible=False), 
+                            half_precision,  # Use the checkbox directly
+                            pretransform_path
+                        ],
                         outputs=[status_boxes[i], gpu_memory]
                     )
                     
@@ -873,6 +931,18 @@ def generate_parallel(prompt, model_indices, **kwargs):
     if 'cfg_interval_min' in kwargs and 'cfg_interval_max' in kwargs:
         generation_kwargs['cfg_interval'] = (kwargs['cfg_interval_min'], kwargs['cfg_interval_max'])
     
+    # Handle seed specially for consistent results across models
+    original_seed = int(kwargs.get('seed', -1))
+    
+    # If seed is -1 (random), generate a single random seed to use for all models
+    if original_seed == -1:
+        # Use numpy for better random number generation
+        master_seed = np.random.randint(0, 2**32 - 1, dtype=np.uint32)
+        print(f"Using master random seed for all models: {master_seed}")
+        generation_kwargs['seed'] = int(master_seed)
+    else:
+        print(f"Using fixed seed for all models: {original_seed}")
+    
     # Create a thread for each model
     for idx in model_indices:
         if idx in model_instances:
@@ -884,8 +954,12 @@ def generate_parallel(prompt, model_indices, **kwargs):
                     temp_model = model_instances[model_idx]["model"]
                     temp_config = model_instances[model_idx]["config"]
                     
+                    # Each worker must use identical parameters for proper comparison
+                    worker_kwargs = generation_kwargs.copy()
+                    
                     # Generate with proper parameters
-                    result = generate_with_model(temp_model, temp_config, prompt, **generation_kwargs)
+                    print(f"Generating with model {model_idx+1}, seed: {worker_kwargs.get('seed', -1)}")
+                    result = generate_with_model(temp_model, temp_config, prompt, **worker_kwargs)
                     thread_results[model_idx] = result
                 except Exception as e:
                     print(f"Error in worker for model {model_idx}: {str(e)}")
