@@ -1,0 +1,9 @@
+{
+    "model_folders": [
+        "./unwrapped"
+    ],
+    "config_folders": [
+        "./wrapped",
+        "./unwrapped"
+    ]
+}
