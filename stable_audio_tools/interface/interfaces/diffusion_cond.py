@@ -8,12 +8,14 @@ import torch
 import torchaudio
 import threading 
 import os, time, math
+import glob
 
 from einops import rearrange
 from torchaudio import transforms as T
 
 from ..aeiou import audio_spectrogram_image
 from ...inference.generation import generate_diffusion_cond, generate_diffusion_cond_inpaint
+from ...inference.filename_utils import extract_params_from_filename
 
 model = None
 model_type = None
@@ -21,6 +23,10 @@ sample_size = 2097152
 sample_rate = 44100
 model_half = True
 diffusion_objective = None
+
+# Navigation state - tracks generated files per model
+generated_files_by_model = {}
+current_file_index_by_model = {}
 
 # when using a prompt in a filename
 def condense_prompt(prompt):
@@ -58,7 +64,12 @@ def generate_cond(
         mask_maskstart=None,
         mask_maskend=None,
         inpaint_audio=None,
-        batch_size=1    
+        batch_size=1,
+        bracket_samplers=False,
+        bracket_sigma=False,
+        *sampler_selections,
+        sigma_min_list="0.01, 0.03, 0.1",
+        sigma_max_list="50, 100, 200"
     ):
 
     if torch.cuda.is_available():
@@ -66,6 +77,85 @@ def generate_cond(
     gc.collect()
 
     print(f"Prompt: {prompt}")
+    
+    # Handle bracketing parameters
+    samplers_to_test = []
+    sigma_mins_to_test = []
+    sigma_maxs_to_test = []
+    
+    # Determine which samplers to test
+    if bracket_samplers:
+        sampler_types_list = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
+        if model.diffusion_objective == "rectified_flow":
+            sampler_types_list = ["euler", "rk4", "dpmpp"]
+        elif model.diffusion_objective == "rf_denoiser":
+            sampler_types_list = ["pingpong"]
+            
+        for i, selected in enumerate(sampler_selections):
+            if selected and i < len(sampler_types_list):
+                samplers_to_test.append(sampler_types_list[i])
+    
+    if not samplers_to_test:
+        samplers_to_test = [sampler_type]
+    
+    # Determine sigma values to test
+    if bracket_sigma:
+        try:
+            sigma_mins_to_test = [float(x.strip()) for x in sigma_min_list.split(',') if x.strip()]
+            sigma_maxs_to_test = [float(x.strip()) for x in sigma_max_list.split(',') if x.strip()]
+        except ValueError:
+            # Fallback to single values if parsing fails
+            sigma_mins_to_test = [sigma_min]
+            sigma_maxs_to_test = [sigma_max]
+    else:
+        sigma_mins_to_test = [sigma_min]
+        sigma_maxs_to_test = [sigma_max]
+    
+    # If bracketing is enabled, generate multiple outputs
+    if bracket_samplers or bracket_sigma:
+        results = []
+        for test_sampler in samplers_to_test:
+            for test_sigma_min in sigma_mins_to_test:
+                for test_sigma_max in sigma_maxs_to_test:
+                    print(f"Testing: sampler={test_sampler}, sigma_min={test_sigma_min}, sigma_max={test_sigma_max}")
+                    
+                    # Recursive call with single parameters
+                    result = generate_cond(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        seconds_start=seconds_start,
+                        seconds_total=seconds_total,
+                        cfg_scale=cfg_scale,
+                        steps=steps,
+                        preview_every=preview_every,
+                        seed=seed,
+                        sampler_type=test_sampler,
+                        sigma_min=test_sigma_min,
+                        sigma_max=test_sigma_max,
+                        rho=rho,
+                        cfg_interval_min=cfg_interval_min,
+                        cfg_interval_max=cfg_interval_max,
+                        cfg_rescale=cfg_rescale,
+                        file_format=file_format,
+                        file_naming=file_naming,
+                        cut_to_seconds_total=cut_to_seconds_total,
+                        init_audio=init_audio,
+                        init_noise_level=init_noise_level,
+                        mask_maskstart=mask_maskstart,
+                        mask_maskend=mask_maskend,
+                        inpaint_audio=inpaint_audio,
+                        batch_size=batch_size,
+                        bracket_samplers=False,  # Disable bracketing for recursive calls
+                        bracket_sigma=False,
+                        *[False] * len(sampler_selections),  # All sampler checkboxes disabled
+                        sigma_min_list=sigma_min_list,
+                        sigma_max_list=sigma_max_list
+                    )
+                    results.append(result)
+        
+        # Return the last result (for now - could be enhanced to return multiple)
+        if results:
+            return results[-1]
 
     global preview_images
     preview_images = []
@@ -282,6 +372,9 @@ def generate_cond(
     # Let's look at a nice spectrogram too
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
 
+    # Store the generated file for navigation
+    add_generated_file(output_filename, [audio_spectrogram, *preview_images])
+    
     # Asynchronously delete the files after returning the output file, so as to prevent clutter in the directory
     if file_naming in ["verbose", "prompt"]:
         delete_files_async([output_wav, output_filename], 30)
@@ -297,13 +390,59 @@ def delete_files_async(filenames, delay):
                 os.remove(filename)  # Delete the file
     threading.Thread(target=delete_files_after_delay, args=(filenames, delay)).start() 
 
+def get_model_id():
+    """Get a unique identifier for the current model"""
+    global model
+    if hasattr(model, 'model_config'):
+        return id(model.model_config)
+    return id(model)
+
+def add_generated_file(audio_file, spectrogram):
+    """Add a newly generated file to the model's file list"""
+    global generated_files_by_model, current_file_index_by_model
+    
+    model_id = get_model_id()
+    if model_id not in generated_files_by_model:
+        generated_files_by_model[model_id] = []
+        current_file_index_by_model[model_id] = 0
+    
+    generated_files_by_model[model_id].append((audio_file, spectrogram))
+    current_file_index_by_model[model_id] = len(generated_files_by_model[model_id]) - 1
+
+def navigate_files(direction):
+    """Navigate through generated files for current model"""
+    global generated_files_by_model, current_file_index_by_model
+    
+    model_id = get_model_id()
+    if model_id not in generated_files_by_model or not generated_files_by_model[model_id]:
+        return None, None
+    
+    files = generated_files_by_model[model_id]
+    current_idx = current_file_index_by_model[model_id]
+    
+    if direction == "prev":
+        new_idx = (current_idx - 1) % len(files)
+    else:  # next
+        new_idx = (current_idx + 1) % len(files)
+    
+    current_file_index_by_model[model_id] = new_idx
+    return files[new_idx]
+
+def navigate_prev():
+    """Navigate to previous file"""
+    return navigate_files("prev")
+
+def navigate_next():
+    """Navigate to next file"""
+    return navigate_files("next")
+
 def create_sampling_ui(model_config):
     global diffusion_objective
     has_inpainting = model_config["model_type"] == "diffusion_cond_inpaint"
     
     model_conditioning_config = model_config["model"].get("conditioning", None)
 
-    diffusion_objective = model.diffusion_objective
+    diffusion_objective = model.diffusion_objective if model is not None else "v"
 
     is_rf = diffusion_objective == "rectified_flow"
 
@@ -329,8 +468,8 @@ def create_sampling_ui(model_config):
         with gr.Column():
             with gr.Row(visible = has_seconds_start or has_seconds_total):
                 # Timing controls
-                seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Seconds start", visible=has_seconds_start)
-                seconds_total_slider = gr.Slider(minimum=0, maximum=512, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
+                seconds_start_slider = gr.Slider(minimum=0, maximum=700, step=1, value=0, label="Seconds start", visible=has_seconds_start)
+                seconds_total_slider = gr.Slider(minimum=0, maximum=700, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
             
             with gr.Row():
                 # Steps slider
@@ -344,18 +483,34 @@ def create_sampling_ui(model_config):
                 steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=default_steps, label="Steps")
                 # CFG scale 
                 default_cfg_scale = 1.0 if is_rf_denoiser else 7.0
-                cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=default_cfg_scale, label="CFG scale")
+                cfg_scale_slider = gr.Slider(
+                    minimum=0.0, maximum=25.0, step=0.1, value=default_cfg_scale, 
+                    label="CFG scale",
+                    info="Classifier-Free Guidance strength. Higher values (7-15) follow prompts more closely but may reduce diversity. 1.0=no guidance. Use CFG interval/rescale parameters below to fine-tune behavior."
+                )
 
             with gr.Accordion("Sampler params", open=False):
                 with gr.Row():
                     # Seed
                     seed_textbox = gr.Textbox(label="Seed (set to -1 for random seed)", value="-1")
 
-                    cfg_interval_min_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG interval min")
-                    cfg_interval_max_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=1.0, label="CFG interval max")
+                    cfg_interval_min_slider = gr.Slider(
+                        minimum=0.0, maximum=1, step=0.01, value=0.0, 
+                        label="CFG interval min",
+                        info="Start applying CFG when noise level ≥ this value. Higher values (0.5+) apply CFG only during early/noisy steps, affecting broad structure while preserving fine details."
+                    )
+                    cfg_interval_max_slider = gr.Slider(
+                        minimum=0.0, maximum=1, step=0.01, value=1.0, 
+                        label="CFG interval max",
+                        info="Stop applying CFG when noise level > this value. Lower values (≤0.5) apply CFG only during late/clean steps, affecting fine details while preserving overall structure."
+                    )
 
                 with gr.Row():
-                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG rescale amount")
+                    cfg_rescale_slider = gr.Slider(
+                        minimum=0.0, maximum=1, step=0.01, value=0.0, 
+                        label="CFG rescale amount",
+                        info="Prevents over-saturation at high CFG scales by normalizing output variance. 0.0=off, 1.0=full rescaling. Helps maintain diversity and prevent artifacts with high CFG values."
+                    )
 
                 with gr.Row():
                     # Sampler params
@@ -369,10 +524,25 @@ def create_sampling_ui(model_config):
                         sampler_types = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
                         default_sampler_type = "dpmpp-3m-sde"
                         
-                    sampler_type_dropdown = gr.Dropdown(sampler_types, label="Sampler type", value=default_sampler_type)
-                    sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.01, label="Sigma min", visible=not (is_rf or is_rf_denoiser))
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=100, label="Sigma max", visible=not (is_rf or is_rf_denoiser))
-                    rho_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.01, value=1.0, label="Sigma curve strength", visible=not (is_rf or is_rf_denoiser))
+                    sampler_type_dropdown = gr.Dropdown(
+                        sampler_types, label="Sampler type", value=default_sampler_type,
+                        info="Denoising algorithm. 'dpmpp-3m-sde' is generally recommended for quality. Different samplers may require different step counts for optimal results."
+                    )
+                    sigma_min_slider = gr.Slider(
+                        minimum=0.0, maximum=2.0, step=0.01, value=0.01, 
+                        label="Sigma min", visible=not (is_rf or is_rf_denoiser),
+                        info="Minimum noise level. Lower values create cleaner outputs but may lose fine details. Typical range: 0.01-0.1."
+                    )
+                    sigma_max_slider = gr.Slider(
+                        minimum=0.0, maximum=1000.0, step=0.1, value=100, 
+                        label="Sigma max", visible=not (is_rf or is_rf_denoiser),
+                        info="Maximum noise level (starting point). Higher values allow more creativity but may reduce stability. Typical range: 50-500."
+                    )
+                    rho_slider = gr.Slider(
+                        minimum=0.0, maximum=10.0, step=0.01, value=1.0, 
+                        label="Sigma curve strength", visible=not (is_rf or is_rf_denoiser),
+                        info="Controls the noise schedule curve. 1.0=linear, >1.0=more time on high noise (more creative), <1.0=more time on low noise (more refinement)."
+                    )
 
             with gr.Accordion("Output params", open=False):
                 # Output params
@@ -399,6 +569,42 @@ def create_sampling_ui(model_config):
                 mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=10, label="Mask Start (sec)")
                 mask_maskend_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=sample_size//sample_rate, label="Mask End (sec)")
 
+            with gr.Accordion("Bracketing (Multi-Parameter Testing)", open=False):
+                gr.Markdown("Select multiple values to test different parameter combinations. Each enabled parameter will generate multiple outputs.")
+                
+                with gr.Row():
+                    bracket_samplers_checkbox = gr.Checkbox(label="Enable sampler bracketing", value=False)
+                    bracket_sigma_checkbox = gr.Checkbox(label="Enable sigma bracketing", value=False, visible=not (is_rf or is_rf_denoiser))
+                
+                # Sampler type checkboxes
+                gr.Markdown("**Sampler Types** (select multiple to test)")
+                sampler_checkboxes = []
+                # Organize samplers in rows of 3-4 for better layout
+                samplers_per_row = 3
+                for i in range(0, len(sampler_types), samplers_per_row):
+                    with gr.Row():
+                        for j in range(samplers_per_row):
+                            if i + j < len(sampler_types):
+                                sampler = sampler_types[i + j]
+                                is_default = sampler == default_sampler_type
+                                checkbox = gr.Checkbox(label=sampler, value=is_default)
+                                sampler_checkboxes.append(checkbox)
+                
+                # Sigma parameter lists
+                with gr.Row():
+                    sigma_min_list = gr.Textbox(
+                        label="Sigma min values (comma-separated)", 
+                        value="0.01, 0.03, 0.1",
+                        visible=not (is_rf or is_rf_denoiser),
+                        info="e.g. 0.01, 0.03, 0.1, 0.3"
+                    )
+                    sigma_max_list = gr.Textbox(
+                        label="Sigma max values (comma-separated)", 
+                        value="50, 100, 200",
+                        visible=not (is_rf or is_rf_denoiser),
+                        info="e.g. 50, 100, 200, 500"
+                    )
+
             inputs = [
                 prompt, 
                 negative_prompt,
@@ -422,19 +628,34 @@ def create_sampling_ui(model_config):
                 init_noise_level_slider,
                 mask_maskstart_slider,
                 mask_maskend_slider,
-                inpaint_audio_input
+                inpaint_audio_input,
+                bracket_samplers_checkbox,
+                bracket_sigma_checkbox,
+                *sampler_checkboxes,
+                sigma_min_list,
+                sigma_max_list
             ]
 
         with gr.Column():
             audio_output = gr.Audio(label="Output audio", interactive=False, 
                     waveform_options=gr.WaveformOptions(show_recording_waveform=False))
             audio_spectrogram_output = gr.Gallery(label="Output spectrogram", show_label=False)
+            
+            # Navigation buttons
+            with gr.Row():
+                prev_button = gr.Button("← Previous", scale=1)
+                next_button = gr.Button("Next →", scale=1)
+            
             send_to_init_button = gr.Button("Send to init audio", scale=1)
             send_to_init_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[init_audio_input])
 
             if has_inpainting:
                 send_to_inpaint_button = gr.Button("Send to inpaint audio", scale=1)
                 send_to_inpaint_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[inpaint_audio_input])
+            
+            # Connect navigation buttons
+            prev_button.click(fn=navigate_prev, inputs=[], outputs=[audio_output, audio_spectrogram_output])
+            next_button.click(fn=navigate_next, inputs=[], outputs=[audio_output, audio_spectrogram_output])
     
     generate_button.click(fn=generate_cond, 
         inputs=inputs,
