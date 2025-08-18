@@ -3,6 +3,9 @@
 Workspace for my tinkering with the code, do not expect for anything to work necessarily as intended, this is mostly for myself to make backups of WIP stuff so far.
 
 # stable-audio-tools
+
+** This is a mostly personal fork to keep track of my changes and simplify my Colab workflow **
+
 Training and inference code for audio generation models
 
 # Install

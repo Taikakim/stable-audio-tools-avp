@@ -9,6 +9,8 @@ import torchaudio
 import os
 import time
 import glob
+import shutil
+import warnings
 from pathlib import Path
 
 from einops import rearrange
@@ -33,18 +35,253 @@ model_a_config = None
 model_b_config = None
 model_a_loaded = False
 model_b_loaded = False
+model_a_loading = False
+model_b_loading = False
 blended_model = None
 sample_rate = 32000
 sample_size = 1920000
+
+# Global results storage for lazy loading and navigation
+current_results_a = []
+current_results_b = []
+current_index_a = 0
+current_index_b = 0
+generation_params_cache = {}
+
+# Global file tracking for session-based cleanup
+current_session_files = []
+previous_session_files = []
+
+# Global caching for model/config discovery
+scan_cache = {
+    'models': [],
+    'configs': [],
+    'last_scan': 0,
+    'cache_duration': 300  # 5 minutes cache
+}
+
+# Audio format support detection
+audio_format_support = {
+    'ffmpeg': False,
+    'mp3': False,
+    'flac': False,
+    'ogg': False,
+    'aac': False,
+    'warnings': []
+}
+
+# Startup timing and progress tracking
+startup_times = {}
+startup_start_time = None
+
+def log_startup_phase(phase_name, start_new_phase=True):
+    """Log startup phase with timing information"""
+    global startup_times, startup_start_time
+    
+    current_time = time.time()
+    
+    # Initialize startup tracking
+    if startup_start_time is None:
+        startup_start_time = current_time
+        startup_times = {}
+        
+        # Print the logo
+        print("")
+        print("   \033[38;5;225m █████  \033[38;5;159m██    ██ \033[38;5;195m███████        \033[38;5;182m ██████  \033[38;5;219m██████   \033[38;5;152m█████  \033[38;5;188m ██████  \033[38;5;224m██ \033[38;5;217m ██████        \033[38;5;158m██       \033[38;5;194m█████  \033[38;5;181m██████")
+        print("   \033[38;5;159m██   ██ \033[38;5;195m██    ██ \033[38;5;182m██   ██        \033[38;5;219m██       \033[38;5;152m██   ██  \033[38;5;188m██   ██ \033[38;5;224m██   ██ \033[38;5;217m██ \033[38;5;158m██    ██       \033[38;5;194m██      \033[38;5;181m██   ██ \033[38;5;225m██   ██")
+        print("   \033[38;5;195m███████ \033[38;5;182m██    ██ \033[38;5;219m███████        \033[38;5;152m██   ███ \033[38;5;188m██████   \033[38;5;224m███████ \033[38;5;217m██   ██ \033[38;5;158m██ \033[38;5;194m██    ██       \033[38;5;181m██      \033[38;5;225m███████ \033[38;5;159m██████")
+        print("   \033[38;5;182m██   ██ \033[38;5;219m ██  ██  \033[38;5;152m██             \033[38;5;188m██    ██ \033[38;5;224m██   ██  \033[38;5;217m██   ██ \033[38;5;158m██   ██ \033[38;5;194m██ \033[38;5;181m██    ██       \033[38;5;225m██      \033[38;5;159m██   ██ \033[38;5;195m██   ██")
+        print("   \033[38;5;219m██   ██ \033[38;5;152m  ████   \033[38;5;188m██             \033[38;5;224m ██████  \033[38;5;217m██   ██  \033[38;5;158m██   ██ \033[38;5;194m██████  \033[38;5;181m██ \033[38;5;225m ██████        \033[38;5;159m███████ \033[38;5;195m██   ██ \033[38;5;182m██████")
+        print("")
+        print("\033[38;5;152m░░░░\033[38;5;188m▒▒▒▒\033[38;5;224m▓▓▓▓\033[38;5;217m████\033[38;5;158m████\033[38;5;194m████\033[38;5;181m▓▓▓▓\033[38;5;225m▒▒▒▒\033[38;5;159m░░░░\033[38;5;195m ░░░░\033[38;5;182m▒▒▒▒\033[38;5;219m▓▓▓▓\033[38;5;152m████\033[38;5;188m████\033[38;5;224m████\033[38;5;217m▓▓▓▓\033[38;5;158m▒▒▒▒\033[38;5;194m░░░░░░░░\033[38;5;181m ░░░░\033[38;5;225m▒▒▒▒\033[38;5;159m▓▓▓▓\033[38;5;195m████\033[38;5;182m████\033[38;5;219m████\033[38;5;152m▓▓▓▓\033[38;5;188m▒▒▒▒\033[38;5;224m░░░░")
+        print("")
+        print("\033[0m", end="")  # Reset to default color (black text)
+        
+        print("🚀 Starting Stable Audio Tools interface...")
+        print(f"⏱️  Startup initiated at {time.strftime('%H:%M:%S')}")
+    
+    # Log completion of previous phase and start new one
+    if startup_times:
+        last_phase = list(startup_times.keys())[-1]
+        if startup_times[last_phase].get('end') is None:
+            startup_times[last_phase]['end'] = current_time
+            duration = current_time - startup_times[last_phase]['start']
+            print(f"✅ {last_phase}: {duration:.2f}s")
+    
+    # Start new phase
+    if start_new_phase:
+        startup_times[phase_name] = {'start': current_time, 'end': None}
+        elapsed_total = current_time - startup_start_time
+        print(f"🔄 {phase_name} (Total elapsed: {elapsed_total:.1f}s)")
+
+def finish_startup():
+    """Finish startup timing and show summary"""
+    global startup_times, startup_start_time
+    
+    if startup_start_time is None:
+        return
+    
+    # Complete final phase
+    log_startup_phase("", start_new_phase=False)
+    
+    total_time = time.time() - startup_start_time
+    print(f"\n🎉 Stable Audio Tools interface ready!")
+    print(f"📊 Total startup time: {total_time:.2f}s")
+    
+    # Show phase breakdown
+    print("📋 Startup phase breakdown:")
+    for phase, times in startup_times.items():
+        if times.get('end'):
+            duration = times['end'] - times['start']
+            percentage = (duration / total_time) * 100
+            print(f"   • {phase}: {duration:.2f}s ({percentage:.1f}%)")
+    
+    print(f"🌐 Interface available at the URLs shown above")
+    print("-" * 60)
 
 # Global storage for discovered models and configs
 available_models = []
 available_configs = []
 gradio_config = None
 
-def load_gradio_config(config_path="./gradio-config.json"):
-    """Load gradio configuration and scan for models and configs"""
-    global gradio_config, available_models, available_configs
+def detect_audio_format_support():
+    """Detect available audio format support and codecs"""
+    global audio_format_support
+    
+    log_startup_phase("Detecting audio format support")
+    
+    # Reset support detection
+    audio_format_support = {
+        'ffmpeg': False,
+        'mp3': False,
+        'flac': False,
+        'ogg': False,
+        'aac': False,
+        'warnings': []
+    }
+    
+    # Check if ffmpeg is available
+    print("   🔍 Checking FFmpeg availability...")
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            audio_format_support['ffmpeg'] = True
+            print("   ✅ FFmpeg found, checking codec support...")
+            ffmpeg_output = result.stdout.lower()
+            
+            # Check for specific codec support
+            if 'libmp3lame' in ffmpeg_output or 'mp3' in ffmpeg_output:
+                audio_format_support['mp3'] = True
+                print("      🎵 MP3 (libmp3lame) - supported")
+            else:
+                print("      ❌ MP3 (libmp3lame) - not available")
+            
+            if 'flac' in ffmpeg_output:
+                audio_format_support['flac'] = True
+                print("      🎵 FLAC - supported")
+            else:
+                print("      ❌ FLAC - not available")
+                
+            if 'libvorbis' in ffmpeg_output or 'vorbis' in ffmpeg_output:
+                audio_format_support['ogg'] = True
+                print("      🎵 OGG Vorbis - supported")
+            else:
+                print("      ❌ OGG Vorbis - not available")
+                
+            if 'aac' in ffmpeg_output or 'libfdk_aac' in ffmpeg_output:
+                audio_format_support['aac'] = True
+                print("      🎵 AAC/M4A - supported")
+            else:
+                print("      ❌ AAC/M4A - not available")
+                
+        else:
+            print("   ❌ FFmpeg found but failed to run")
+            audio_format_support['warnings'].append("FFmpeg found but failed to run")
+            
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        print("   ❌ FFmpeg found but not responding properly")
+        audio_format_support['warnings'].append("FFmpeg found but not responding properly")
+    except FileNotFoundError:
+        print("   ❌ FFmpeg not found in PATH")
+        audio_format_support['warnings'].append("FFmpeg not found in PATH")
+    except Exception as e:
+        print(f"   ❌ Error checking FFmpeg: {str(e)}")
+        audio_format_support['warnings'].append(f"Error checking FFmpeg: {str(e)}")
+    
+    # Check Python audio libraries
+    try:
+        import soundfile as sf
+        # soundfile can handle FLAC natively
+        if not audio_format_support['flac']:
+            audio_format_support['flac'] = True
+    except ImportError:
+        pass
+    
+    # Generate warnings for missing support
+    if not audio_format_support['ffmpeg']:
+        audio_format_support['warnings'].append("⚠️  No FFmpeg detected - only WAV output available")
+    else:
+        missing_formats = []
+        if not audio_format_support['mp3']:
+            missing_formats.append("MP3")
+        if not audio_format_support['flac']:
+            missing_formats.append("FLAC")
+        if not audio_format_support['ogg']:
+            missing_formats.append("OGG")
+        if not audio_format_support['aac']:
+            missing_formats.append("AAC/M4A")
+            
+        if missing_formats:
+            audio_format_support['warnings'].append(
+                f"⚠️  Limited codec support - missing: {', '.join(missing_formats)}"
+            )
+    
+    return audio_format_support
+
+def get_available_audio_formats():
+    """Get list of available audio formats based on detected support"""
+    global audio_format_support
+    
+    # Always available
+    formats = ["wav"]
+    
+    if audio_format_support['flac']:
+        formats.append("flac")
+    
+    if audio_format_support['mp3']:
+        formats.extend(["mp3 320k", "mp3 v0", "mp3 128k"])
+    
+    if audio_format_support['ogg']:
+        formats.extend(["ogg 192k", "ogg 96k"])
+    
+    if audio_format_support['aac']:
+        formats.extend(["m4a aac_he_v2 64k", "m4a aac_he_v2 32k"])
+    
+    return formats
+
+def get_format_warnings():
+    """Get formatted warning messages for display"""
+    global audio_format_support
+    warnings = audio_format_support.get('warnings', [])
+    if warnings:
+        return "\n".join(warnings)
+    return "✅ All audio formats supported"
+
+def load_gradio_config(config_path="./gradio-config.json", force_rescan=False):
+    """Load gradio configuration and scan for models and configs with caching"""
+    global gradio_config, available_models, available_configs, scan_cache
+    
+    # Check if we can use cached results
+    current_time = time.time()
+    if not force_rescan and (current_time - scan_cache['last_scan']) < scan_cache['cache_duration']:
+        if scan_cache['models'] and scan_cache['configs']:
+            available_models = scan_cache['models']
+            available_configs = scan_cache['configs']
+            print(f"📋 Using cached scan results ({len(available_models)} models, {len(available_configs)} configs)")
+            return available_models, available_configs
+    
+    log_startup_phase("Loading configuration and scanning for models")
     
     try:
         with open(config_path, 'r') as f:
@@ -59,33 +296,43 @@ def load_gradio_config(config_path="./gradio-config.json"):
             json.dump(gradio_config, f, indent=4)
         print(f"Created default gradio config at {config_path}")
     
-    # Scan for models (only unwrapped models)
+    # Scan for models (only unwrapped models) - using glob for faster scanning
     available_models = []
     for folder in gradio_config.get("model_folders", []):
         if os.path.exists(folder):
-            for root, dirs, files in os.walk(folder):
-                for file in files:
-                    if file.endswith('.ckpt'):
-                        full_path = os.path.abspath(os.path.join(root, file))
-                        # Only include models that have "unwrapped" in their path (case-insensitive)
-                        if "unwrapped" in full_path.lower():
-                            available_models.append(full_path)
+            # Use glob for faster file discovery
+            import glob
+            pattern = os.path.join(folder, "**", "*.ckpt")
+            for ckpt_file in glob.glob(pattern, recursive=True):
+                full_path = os.path.abspath(ckpt_file)
+                # Only include models that have "unwrapped" in their path (case-insensitive)
+                if "unwrapped" in full_path.lower():
+                    available_models.append(full_path)
     
-    # Scan for configs
+    # Scan for configs - using glob for faster scanning
     available_configs = []
     for folder in gradio_config.get("config_folders", []):
         if os.path.exists(folder):
-            for root, dirs, files in os.walk(folder):
-                for file in files:
-                    if file.endswith('.json'):
-                        full_path = os.path.abspath(os.path.join(root, file))
-                        if is_model_config(full_path):
-                            available_configs.append(full_path)
+            import glob
+            pattern = os.path.join(folder, "**", "*.json")
+            for json_file in glob.glob(pattern, recursive=True):
+                full_path = os.path.abspath(json_file)
+                if is_model_config(full_path):
+                    available_configs.append(full_path)
     
-    print(f"Found {len(available_models)} unwrapped model files and {len(available_configs)} config files")
+    # Update cache
+    scan_cache['models'] = available_models.copy()
+    scan_cache['configs'] = available_configs.copy()
+    scan_cache['last_scan'] = current_time
+    
+    print(f"   📁 Scanned {len(gradio_config.get('model_folders', []))} model folders")
+    print(f"   📁 Scanned {len(gradio_config.get('config_folders', []))} config folders") 
+    print(f"   🤖 Found {len(available_models)} unwrapped model files")
+    print(f"   ⚙️  Found {len(available_configs)} config files")
+    
     if len(available_models) == 0:
-        print("WARNING: No unwrapped model files found. Model paths must contain 'unwrapped' to be loaded.")
-        print("Use unwrap_model.py to convert training checkpoints to inference-ready models.")
+        print("   ⚠️  WARNING: No unwrapped model files found. Model paths must contain 'unwrapped' to be loaded.")
+        print("   💡 Use unwrap_model.py to convert training checkpoints to inference-ready models.")
     return available_models, available_configs
 
 def is_model_config(json_path):
@@ -121,14 +368,361 @@ def get_compatible_configs(model_path):
     # For now, return all configs - could implement smarter compatibility checking
     return available_configs
 
+def cleanup_previous_session_files():
+    """Clean up files from previous generation session"""
+    global previous_session_files
+    
+    for filepath in previous_session_files:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            print(f"Warning: Could not delete file {filepath}: {e}")
+    
+    previous_session_files = []
+
+def generate_audio_lazy(param_combo, model, model_config, model_prefix, generation_args):
+    """Generate audio file lazily when requested"""
+    try:
+        steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = param_combo
+        
+        # Call model-specific generation function
+        audio_file, spectrogram = generate_cond_with_model(
+            model=model,
+            model_type=model_config["model_type"],
+            sample_rate=model_config["sample_rate"],
+            sample_size=model_config["sample_size"],
+            model_prefix=model_prefix,
+            steps=steps,
+            cfg_scale=cfg,
+            cfg_rescale=cfg_rescale,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            sampler_type=sampler,
+            **generation_args
+        )
+        
+        return audio_file, spectrogram
+    except Exception as e:
+        print(f"Error in lazy generation: {str(e)}")
+        return None, None
+
+def create_param_description(steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler, seed=None, exclude_prompt=True):
+    """Create readable parameter description for dropdown"""
+    parts = []
+    parts.append(f"Steps: {steps}")
+    parts.append(f"CFG: {cfg}")
+    if cfg_rescale != 0.0:
+        parts.append(f"CFG Rescale: {cfg_rescale}")
+    parts.append(f"Sigma: {sigma_min}-{sigma_max}")
+    parts.append(f"Sampler: {sampler}")
+    if seed is not None:
+        parts.append(f"Seed: {seed}")
+    return " | ".join(parts)
+
+def create_cfg_interval_visualization(steps, cfg_interval_min, cfg_interval_max, sigma_min=0.03, sigma_max=500, rho=1.0, sampler_type="dpmpp-3m-sde", width=1024, height=256):
+    """Create visualization showing when CFG interval is active during denoising using REAL sigma schedule"""
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from io import BytesIO
+    import tempfile
+    
+    # Import k-diffusion to get the EXACT same sigma schedule used in generation
+    try:
+        import k_diffusion as K
+        # Use the EXACT same function that generates sigmas in sample_k
+        device = 'cpu'  # For visualization, we don't need GPU
+        sigmas = K.sampling.get_sigmas_polyexponential(steps, sigma_min, sigma_max, rho, device=device)
+        sigma_values = sigmas.cpu().numpy()
+        using_real_schedule = True
+        schedule_type = "Real K-Diffusion Schedule"
+    except ImportError:
+        # Fallback to approximation if k_diffusion not available
+        step_positions = np.linspace(0, 1, steps)
+        sigma_values = sigma_max * ((sigma_min / sigma_max) ** (step_positions ** rho))
+        using_real_schedule = False
+        schedule_type = "Approximated Schedule"
+    
+    # Create larger figure (doubled area: 1024x256 instead of 512x64)
+    fig, ax = plt.subplots(figsize=(width/80, height/80), dpi=100)
+    fig.patch.set_facecolor('black')
+    ax.set_facecolor('black')
+    
+    # Step positions for x-axis
+    step_positions = np.linspace(0, 1, len(sigma_values))
+    
+    # Use log scale for better visualization of sigma curve
+    log_sigma_values = np.log10(sigma_values + 1e-10)  # Add small epsilon to avoid log(0)
+    log_sigma_min = np.log10(sigma_min + 1e-10)
+    log_sigma_max = np.log10(sigma_max + 1e-10)
+    
+    # Normalize log sigma values to [0, 1] for visualization
+    sigma_normalized = (log_sigma_values - log_sigma_min) / (log_sigma_max - log_sigma_min)
+    sigma_normalized = np.clip(sigma_normalized, 0, 1)
+    
+    # Plot the REAL sigma curve with gradient fill
+    ax.plot(step_positions, sigma_normalized, color='cyan', linewidth=4, alpha=0.9, 
+            label=f'{schedule_type}', marker='o', markersize=3, markevery=max(1, len(step_positions)//20))
+    ax.fill_between(step_positions, 0, sigma_normalized, color='cyan', alpha=0.3)
+    
+    # Add fine grid for better readability
+    ax.grid(True, alpha=0.4, color='gray', linestyle=':', linewidth=1)
+    ax.grid(True, alpha=0.2, color='gray', linestyle='-', linewidth=0.5, which='minor')
+    
+    # Find CFG active region based on REAL sigma values
+    cfg_active_mask = (sigma_values >= cfg_interval_min) & (sigma_values <= cfg_interval_max)
+    
+    if np.any(cfg_active_mask):
+        # Highlight CFG active region with stronger visual emphasis
+        ax.fill_between(step_positions, 0, 1, where=cfg_active_mask, 
+                       color='lime', alpha=0.5, label='CFG Active Region')
+        
+        # Add boundary markers with better positioning
+        active_indices = np.where(cfg_active_mask)[0]
+        if len(active_indices) > 0:
+            start_idx = active_indices[0]
+            end_idx = active_indices[-1]
+            
+            # CFG start line with shadow effect
+            ax.axvline(x=step_positions[start_idx], color='white', linewidth=4, alpha=0.5)
+            ax.axvline(x=step_positions[start_idx], color='lime', linewidth=3, linestyle='--')
+            ax.text(step_positions[start_idx], 0.85, f'CFG START\nσ={sigma_values[start_idx]:.2f}\nStep {start_idx}', 
+                   color='lime', fontsize=10, ha='center', va='center', weight='bold',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.8, edgecolor='lime'))
+            
+            # CFG end line with shadow effect
+            if end_idx < len(step_positions) - 1:
+                ax.axvline(x=step_positions[end_idx], color='white', linewidth=4, alpha=0.5)
+                ax.axvline(x=step_positions[end_idx], color='orange', linewidth=3, linestyle='--')
+                ax.text(step_positions[end_idx], 0.85, f'CFG END\nσ={sigma_values[end_idx]:.2f}\nStep {end_idx}', 
+                       color='orange', fontsize=10, ha='center', va='center', weight='bold',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.8, edgecolor='orange'))
+    
+    # Add logarithmic sigma value labels on y-axis for better readability
+    if sigma_max > 100:
+        sigma_ticks = [sigma_max, 100, 10, 1, 0.1, sigma_min]
+    else:
+        sigma_ticks = [sigma_max, sigma_max/2, sigma_max/10, sigma_min]
+    
+    # Filter out ticks that are outside our range
+    sigma_ticks = [s for s in sigma_ticks if sigma_min <= s <= sigma_max]
+    
+    log_sigma_ticks = [np.log10(s + 1e-10) for s in sigma_ticks]
+    sigma_tick_positions = [(log_s - log_sigma_min) / (log_sigma_max - log_sigma_min) for log_s in log_sigma_ticks]
+    sigma_tick_positions = [max(0, min(1, pos)) for pos in sigma_tick_positions]
+    
+    ax.set_yticks(sigma_tick_positions)
+    ax.set_yticklabels([f'{s:.3f}' if s < 1 else f'{s:.1f}' for s in sigma_ticks])
+    
+    # Add more detailed step markers on x-axis
+    step_markers = [0, steps//8, steps//4, 3*steps//8, steps//2, 5*steps//8, 3*steps//4, 7*steps//8, steps-1]
+    step_markers = [s for s in step_markers if s < steps]  # Filter valid steps
+    step_positions_markers = [i/(steps-1) for i in step_markers]
+    ax.set_xticks(step_positions_markers)
+    ax.set_xticklabels([f'{i}' for i in step_markers])
+    
+    # Enhanced styling with better fonts and colors
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel('Denoising Steps', color='white', fontsize=12, weight='bold')
+    ax.set_ylabel('Noise Level σ (log scale)', color='white', fontsize=12, weight='bold')
+    ax.tick_params(colors='white', labelsize=10)
+    
+    # Style the spines
+    for spine in ax.spines.values():
+        spine.set_color('white')
+        spine.set_linewidth(2)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    # Add informative title and subtitle
+    title_main = f'Real Denoising Trajectory Analysis'
+    title_sub = f'Sampler: {sampler_type} | Steps: {steps} | σ range: [{sigma_min:.3f}, {sigma_max:.1f}] | ρ: {rho}'
+    ax.set_title(title_main, color='white', fontsize=14, weight='bold', pad=20)
+    ax.text(0.5, 0.95, title_sub, transform=ax.transAxes, color='lightgray', 
+            fontsize=10, ha='center', va='top')
+    
+    # Add legend
+    ax.legend(loc='upper right', facecolor='black', edgecolor='white', labelcolor='white')
+    
+    # Convert to base64 image
+    buf = BytesIO()
+    plt.savefig(buf, format='png', facecolor='black', edgecolor='white', 
+                bbox_inches='tight', dpi=80)
+    buf.seek(0)
+    plt.close(fig)
+    
+    # Return as file path for Gradio
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+        tmp.write(buf.getvalue())
+        return tmp.name
+
+def get_current_audio_a():
+    """Get current audio A with lazy loading"""
+    global current_results_a, current_index_a, generation_params_cache
+    
+    if not current_results_a or current_index_a >= len(current_results_a):
+        return None, None, None, "No results available"
+    
+    result = current_results_a[current_index_a]
+    
+    # Check if audio is already loaded
+    if result.get('audio') is None:
+        # Lazy load the audio
+        cache_key = result['cache_key']
+        if cache_key in generation_params_cache:
+            params = generation_params_cache[cache_key]
+            audio, spectrogram = generate_audio_lazy(
+                result['param_combo'],
+                params['model'],
+                params['model_config'],
+                params['model_prefix'],
+                params['generation_args']
+            )
+            result['audio'] = audio
+            result['spectrogram'] = spectrogram
+    
+    # Generate CFG visualization for current parameters
+    if 'cache_key' in result and result['cache_key'] in generation_params_cache:
+        gen_args = generation_params_cache[result['cache_key']]['generation_args']
+        steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = result['param_combo']
+        cfg_viz = create_cfg_interval_visualization(
+            steps=int(steps),
+            cfg_interval_min=gen_args.get('cfg_interval_min', 0.0),
+            cfg_interval_max=gen_args.get('cfg_interval_max', 1.0),
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
+            rho=gen_args.get('rho', 1.0),
+            sampler_type=sampler
+        )
+    else:
+        cfg_viz = None
+    
+    # Add n/x counter to params display
+    base_params = result.get('params', '')
+    total_results = len(current_results_a)
+    current_position = current_index_a + 1
+    params_with_counter = f"[{current_position}/{total_results}] {base_params}"
+    
+    return result.get('audio'), cfg_viz, result.get('spectrogram'), params_with_counter
+
+def get_current_audio_b():
+    """Get current audio B with lazy loading"""
+    global current_results_b, current_index_b, generation_params_cache
+    
+    if not current_results_b or current_index_b >= len(current_results_b):
+        return None, None, None, "No results available"
+    
+    result = current_results_b[current_index_b]
+    
+    # Check if audio is already loaded
+    if result.get('audio') is None:
+        # Lazy load the audio
+        cache_key = result['cache_key']
+        if cache_key in generation_params_cache:
+            params = generation_params_cache[cache_key]
+            audio, spectrogram = generate_audio_lazy(
+                result['param_combo'],
+                params['model'],
+                params['model_config'],
+                params['model_prefix'],
+                params['generation_args']
+            )
+            result['audio'] = audio
+            result['spectrogram'] = spectrogram
+    
+    # Generate CFG visualization for current parameters
+    if 'cache_key' in result and result['cache_key'] in generation_params_cache:
+        gen_args = generation_params_cache[result['cache_key']]['generation_args']
+        steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = result['param_combo']
+        cfg_viz = create_cfg_interval_visualization(
+            steps=int(steps),
+            cfg_interval_min=gen_args.get('cfg_interval_min', 0.0),
+            cfg_interval_max=gen_args.get('cfg_interval_max', 1.0),
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
+            rho=gen_args.get('rho', 1.0),
+            sampler_type=sampler
+        )
+    else:
+        cfg_viz = None
+    
+    # Add n/x counter to params display
+    base_params = result.get('params', '')
+    total_results = len(current_results_b)
+    current_position = current_index_b + 1
+    params_with_counter = f"[{current_position}/{total_results}] {base_params}"
+    
+    return result.get('audio'), cfg_viz, result.get('spectrogram'), params_with_counter
+
+def navigate_audio_a(direction):
+    """Navigate audio A results (direction: -1 for prev, 1 for next)"""
+    global current_index_a, current_results_a
+    
+    if not current_results_a:
+        return None, None, None, "No results available"
+    
+    current_index_a = max(0, min(len(current_results_a) - 1, current_index_a + direction))
+    return get_current_audio_a()
+
+def navigate_audio_b(direction):
+    """Navigate audio B results (direction: -1 for prev, 1 for next)"""
+    global current_index_b, current_results_b
+    
+    if not current_results_b:
+        return None, None, None, "No results available"
+    
+    current_index_b = max(0, min(len(current_results_b) - 1, current_index_b + direction))
+    return get_current_audio_b()
+
+def select_audio_a_by_index(selected_description):
+    """Select Model A audio by parameter description from dropdown"""
+    global current_index_a, current_results_a
+    
+    if not current_results_a or not selected_description:
+        return None, None, None, "No results available"
+    
+    # Find the index of the selected description
+    for i, result in enumerate(current_results_a):
+        if result['params'] == selected_description:
+            current_index_a = i
+            return get_current_audio_a()
+    
+    return get_current_audio_a()  # Fallback to current
+
+def select_audio_b_by_index(selected_description):
+    """Select Model B audio by parameter description from dropdown"""
+    global current_index_b, current_results_b
+    
+    if not current_results_b or not selected_description:
+        return None, None, None, "No results available"
+    
+    # Find the index of the selected description
+    for i, result in enumerate(current_results_b):
+        if result['params'] == selected_description:
+            current_index_b = i
+            return get_current_audio_b()
+    
+    return get_current_audio_b()  # Fallback to current
+
 def load_model_a(config_path, model_path, model_half=True):
     """Load model A"""
-    global model_a, model_a_config, model_a_loaded, sample_rate, sample_size
+    global model_a, model_a_config, model_a_loaded, model_a_loading, model_b_loading, sample_rate, sample_size
     
     try:
         if not config_path or not model_path:
             return "Please select both config and model files"
             
+        # Check if any model is currently loading
+        if model_a_loading:
+            return "Model A is already loading, please wait..."
+        if model_b_loading:
+            return "Model B is currently loading, please wait for it to finish"
+            
+        model_a_loading = True
+        
         # Load config
         with open(config_path, 'r') as f:
             model_a_config = json.load(f)
@@ -142,6 +736,8 @@ def load_model_a(config_path, model_path, model_half=True):
     except Exception as e:
         model_a_loaded = False
         return f"Error loading Model A: {str(e)}"
+    finally:
+        model_a_loading = False
 
 def unload_model_a():
     """Unload model A from memory"""
@@ -162,12 +758,20 @@ def unload_model_a():
 
 def load_model_b(config_path, model_path, model_half=True):
     """Load model B"""
-    global model_b, model_b_config, model_b_loaded
+    global model_b, model_b_config, model_b_loaded, model_b_loading, model_a_loading
     
     try:
         if not config_path or not model_path:
             return "Please select both config and model files"
             
+        # Check if any model is currently loading
+        if model_b_loading:
+            return "Model B is already loading, please wait..."
+        if model_a_loading:
+            return "Model A is currently loading, please wait for it to finish"
+            
+        model_b_loading = True
+        
         # Load config
         with open(config_path, 'r') as f:
             model_b_config = json.load(f)
@@ -181,6 +785,8 @@ def load_model_b(config_path, model_path, model_half=True):
     except Exception as e:
         model_b_loaded = False
         return f"Error loading Model B: {str(e)}"
+    finally:
+        model_b_loading = False
 
 def unload_model_b():
     """Unload model B from memory"""
@@ -203,6 +809,7 @@ def create_dual_model_interface():
     """Create interface for dual model comparison"""
     global available_models, available_configs
     
+    print("   🔧 Setting up dual model interface...")
     gr.Markdown("## Dual Model Comparison Interface")
     
     if len(available_models) == 0:
@@ -286,22 +893,30 @@ def create_dual_model_interface():
         outputs=[status_b]
     )
     
-    # Refresh button
-    refresh_button = gr.Button("Refresh Model Lists", variant="secondary")
+    # Refresh buttons
+    with gr.Row():
+        refresh_button = gr.Button("Refresh Lists (Cached)", variant="secondary", scale=2)
+        force_rescan_button = gr.Button("Force Full Rescan", variant="primary", scale=1)
     
-    def refresh_lists():
+    def refresh_lists(force_rescan=False):
         global available_models, available_configs
-        load_gradio_config()
+        load_gradio_config(force_rescan=force_rescan)
         return (
-            gr.Dropdown.update(choices=available_configs),
-            gr.Dropdown.update(choices=available_models),
-            gr.Dropdown.update(choices=available_configs),
-            gr.Dropdown.update(choices=available_models),
+            gr.update(choices=available_configs),
+            gr.update(choices=available_models),
+            gr.update(choices=available_configs),
+            gr.update(choices=available_models),
             f"Found {len(available_models)} models and {len(available_configs)} configs"
         )
     
     refresh_button.click(
-        fn=refresh_lists,
+        fn=lambda: refresh_lists(force_rescan=False),
+        inputs=[],
+        outputs=[config_a_dropdown, model_a_dropdown, config_b_dropdown, model_b_dropdown, status_a]
+    )
+    
+    force_rescan_button.click(
+        fn=lambda: refresh_lists(force_rescan=True),
         inputs=[],
         outputs=[config_a_dropdown, model_a_dropdown, config_b_dropdown, model_b_dropdown, status_a]
     )
@@ -316,23 +931,31 @@ def load_preset(preset_name):
         
         if preset_name in presets:
             preset = presets[preset_name]
+            # Convert sampler checkboxes
+            samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
+            selected_samplers = preset.get('selected_samplers', [preset.get('sampler_type', 'dpmpp-3m-sde')])  # Backward compatibility
+            sampler_checkboxes = [sampler in selected_samplers for sampler in samplers]
+            
             return (
                 preset.get('prompt', ''),
                 preset.get('negative_prompt', ''),
-                preset.get('steps', 100),
-                preset.get('cfg_scale', 7.0),
-                preset.get('cfg_rescale', 0.0),
-                preset.get('sigma_min', 0.03),
-                preset.get('sigma_max', 500),
-                preset.get('sampler_type', 'dpmpp-3m-sde'),
+                preset.get('steps', '100'),
+                preset.get('cfg_scale', '7.0'),
+                preset.get('cfg_rescale', '0.0'),
+                preset.get('sigma_min', '0.03'),
+                preset.get('sigma_max', '500'),
+                *sampler_checkboxes,
                 f"Loaded preset: {preset_name}"
             )
     except:
         pass
     
-    return ("", "", 100, 7.0, 0.0, 0.03, 500, "dpmpp-3m-sde", "Failed to load preset")
+    # Default values with default sampler selected
+    samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
+    default_checkboxes = [sampler == "dpmpp-3m-sde" for sampler in samplers]
+    return ("", "", "100", "7.0", "0.0", "0.03", "500", *default_checkboxes, "Failed to load preset")
 
-def save_preset(preset_name, prompt, negative_prompt, steps, cfg_scale, cfg_rescale, sigma_min, sigma_max, sampler_type):
+def save_preset(preset_name, prompt, negative_prompt, steps, cfg_scale, cfg_rescale, sigma_min, sigma_max, *sampler_checkboxes):
     """Save current parameters as preset"""
     try:
         # Load existing presets
@@ -341,6 +964,10 @@ def save_preset(preset_name, prompt, negative_prompt, steps, cfg_scale, cfg_resc
                 presets = json.load(f)
         except:
             presets = {}
+        
+        # Convert sampler checkboxes to list of selected samplers
+        samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
+        selected_samplers = [samplers[i] for i, selected in enumerate(sampler_checkboxes) if selected and i < len(samplers)]
         
         # Add new preset
         presets[preset_name] = {
@@ -351,7 +978,7 @@ def save_preset(preset_name, prompt, negative_prompt, steps, cfg_scale, cfg_resc
             'cfg_rescale': cfg_rescale,
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
-            'sampler_type': sampler_type
+            'selected_samplers': selected_samplers
         }
         
         # Save presets
@@ -404,6 +1031,11 @@ def calculate_generation_count(steps_list, cfg_list, cfg_rescale_list, sigma_min
 def create_comparison_sampling_ui(model_a_active, model_b_active):
     """Create main sampling interface with bracketing and dual model support"""
     
+    log_startup_phase("Creating user interface components")
+    
+    # Initialize audio format detection
+    detect_audio_format_support()
+    
     gr.Markdown("## Generation Parameters")
     
     # Preset management
@@ -440,12 +1072,6 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
             cfg_list = gr.Textbox(label="CFG Scale", value="7.0", placeholder="e.g. 5.0, 7.0, 10.0")
             cfg_rescale_list = gr.Textbox(label="CFG Rescale", value="0.0", placeholder="e.g. 0.0, 0.2, 0.5")
         
-        with gr.Row():
-            sampler_type_dropdown = gr.Dropdown(
-                ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"], 
-                label="Default Sampler", value="dpmpp-3m-sde",
-                info="Default sampler when not using bracketing"
-            )
         
         with gr.Row():
             sigma_min_list = gr.Textbox(label="Sigma Min", value="0.03", placeholder="e.g. 0.01, 0.03, 0.1")
@@ -453,12 +1079,12 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
         
         # Sampler checkboxes
         gr.Markdown("**Select Samplers to Test:**")
-        samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2"]
+        samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
         sampler_checkboxes = []
         
         with gr.Row():
             for i, sampler in enumerate(samplers):
-                checkbox = gr.Checkbox(label=sampler, value=(i == 1))  # Default to dpmpp-3m-sde
+                checkbox = gr.Checkbox(label=sampler, value=(i == 1))  # Default to dpmpp-3m-sde (index 1)
                 sampler_checkboxes.append(checkbox)
         
         # Generation count display
@@ -505,9 +1131,13 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
     # Output parameters
     with gr.Accordion("Output Parameters", open=False):
         with gr.Row():
+            # Detect audio format support on startup
+            available_formats = get_available_audio_formats()
             file_format_dropdown = gr.Dropdown(
-                ["wav", "flac", "mp3 320k", "mp3 v0", "mp3 128k", "m4a aac_he_v2 64k", "m4a aac_he_v2 32k"], 
-                label="File format", value="wav"
+                available_formats, 
+                label="File format", 
+                value="wav",
+                info="Available formats based on detected system capabilities"
             )
             file_naming_dropdown = gr.Dropdown(
                 ["verbose", "prompt", "output.wav"], 
@@ -531,15 +1161,25 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
         mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=120, step=0.1, value=10, label="Mask Start (sec)")
         mask_maskend_slider = gr.Slider(minimum=0.0, maximum=120, step=0.1, value=40, label="Mask End (sec)")
     
+    # Audio format support warnings
+    with gr.Accordion("🔊 Audio Format Support", open=False):
+        format_warnings = gr.Textbox(
+            label="System Audio Capabilities",
+            value=get_format_warnings(),
+            interactive=False,
+            lines=3,
+            info="Detected audio format support on your system"
+        )
+    
     # Audio outputs section
-    audio_output_a, spectrogram_a, params_a, audio_output_b, spectrogram_b, params_b = create_audio_outputs_section()
+    audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b, prev_a_btn, next_a_btn, prev_b_btn, next_b_btn = create_audio_outputs_section()
     
     # Connect generate button
     generate_button.click(
         fn=generate_dual_model_comparison,
         inputs=[
             prompt, negative_prompt, steps_list, cfg_list, cfg_rescale_list,
-            sigma_min_list, sigma_max_list, sampler_type_dropdown, *sampler_checkboxes,
+            sigma_min_list, sigma_max_list, *sampler_checkboxes,
             seed_input, seconds_start_slider, seconds_total, batch_size, 
             cfg_interval_min_slider, cfg_interval_max_slider, rho_slider,
             preview_every_slider, file_format_dropdown, file_naming_dropdown,
@@ -547,20 +1187,58 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
             mask_maskstart_slider, mask_maskend_slider, inpaint_audio_input,
             model_a_active, model_b_active
         ],
-        outputs=[audio_output_a, spectrogram_a, audio_output_b, spectrogram_b, params_a, params_b]
+        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, audio_output_b, cfg_viz_b, spectrogram_b, params_a, params_b, param_dropdown_a, param_dropdown_b]
     )
     
     # Connect preset functionality
     load_preset_btn.click(
         fn=load_preset,
         inputs=[preset_dropdown],
-        outputs=[prompt, negative_prompt, steps_list, cfg_list, cfg_rescale_list, sigma_min_list, sigma_max_list, sampler_type_dropdown, preset_status]
+        outputs=[prompt, negative_prompt, steps_list, cfg_list, cfg_rescale_list, sigma_min_list, sigma_max_list, *sampler_checkboxes, preset_status]
     )
     
     save_preset_btn.click(
         fn=save_preset,
-        inputs=[preset_name_input, prompt, negative_prompt, steps_list, cfg_list, cfg_rescale_list, sigma_min_list, sigma_max_list, sampler_type_dropdown],
+        inputs=[preset_name_input, prompt, negative_prompt, steps_list, cfg_list, cfg_rescale_list, sigma_min_list, sigma_max_list, *sampler_checkboxes],
         outputs=[preset_status]
+    )
+    
+    # Connect navigation buttons
+    prev_a_btn.click(
+        fn=lambda: navigate_audio_a(-1),
+        inputs=[],
+        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, params_a]
+    )
+    
+    next_a_btn.click(
+        fn=lambda: navigate_audio_a(1),
+        inputs=[],
+        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, params_a]
+    )
+    
+    prev_b_btn.click(
+        fn=lambda: navigate_audio_b(-1),
+        inputs=[],
+        outputs=[audio_output_b, cfg_viz_b, spectrogram_b, params_b]
+    )
+    
+    next_b_btn.click(
+        fn=lambda: navigate_audio_b(1),
+        inputs=[],
+        outputs=[audio_output_b, cfg_viz_b, spectrogram_b, params_b]
+    )
+    
+    # Connect dropdown selections
+    param_dropdown_a.change(
+        fn=select_audio_a_by_index,
+        inputs=[param_dropdown_a],
+        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, params_a]
+    )
+    
+    param_dropdown_b.change(
+        fn=select_audio_b_by_index,
+        inputs=[param_dropdown_b],
+        outputs=[audio_output_b, cfg_viz_b, spectrogram_b, params_b]
     )
 
 def create_audio_outputs_section():
@@ -572,11 +1250,21 @@ def create_audio_outputs_section():
         with gr.Column():
             gr.Markdown("### Model A Results")
             audio_output_a = gr.Audio(label="Audio A", interactive=False)
+            cfg_viz_a = gr.Image(label="CFG Interval Visualization A", show_label=True, interactive=False)
             spectrogram_a = gr.Gallery(label="Spectrogram A", show_label=False)
             
             with gr.Row():
                 prev_a_btn = gr.Button("← Prev A")
                 next_a_btn = gr.Button("Next A →")
+            
+            # Parameter selection dropdown for Model A
+            param_dropdown_a = gr.Dropdown(
+                choices=[],
+                label="Select Parameters A",
+                info="Choose from generated parameter combinations",
+                interactive=True,
+                allow_custom_value=True
+            )
             
             # Generation parameters display for Model A
             params_a = gr.Textbox(label="Generation Parameters A", interactive=False, lines=3)
@@ -585,16 +1273,26 @@ def create_audio_outputs_section():
         with gr.Column():
             gr.Markdown("### Model B Results")
             audio_output_b = gr.Audio(label="Audio B", interactive=False)
+            cfg_viz_b = gr.Image(label="CFG Interval Visualization B", show_label=True, interactive=False)
             spectrogram_b = gr.Gallery(label="Spectrogram B", show_label=False)
             
             with gr.Row():
                 prev_b_btn = gr.Button("← Prev B")
                 next_b_btn = gr.Button("Next B →")
             
+            # Parameter selection dropdown for Model B
+            param_dropdown_b = gr.Dropdown(
+                choices=[],
+                label="Select Parameters B",
+                info="Choose from generated parameter combinations",
+                interactive=True,
+                allow_custom_value=True
+            )
+            
             # Generation parameters display for Model B
             params_b = gr.Textbox(label="Generation Parameters B", interactive=False, lines=3)
     
-    return audio_output_a, spectrogram_a, params_a, audio_output_b, spectrogram_b, params_b
+    return audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b, prev_a_btn, next_a_btn, prev_b_btn, next_b_btn
 
 def create_tooltips_section():
     """Create informational tooltips section at bottom"""
@@ -646,20 +1344,17 @@ def generate_dual_model_comparison(
             # Extract all parameters
             remaining_params = remaining_args[:-2]  # Remove model states
             
-            # Extract default sampler (string) and then sampler checkboxes (booleans)
-            default_sampler_type = remaining_params[0] if remaining_params else "dpmpp-3m-sde"
-            remaining_after_sampler = remaining_params[1:] if len(remaining_params) > 1 else []
-            
+            # Extract sampler checkboxes (booleans) from the start of remaining_params
             # Find where sampler checkboxes end (they should be boolean values)
             sampler_end_idx = 0
-            for i, arg in enumerate(remaining_after_sampler):
+            for i, arg in enumerate(remaining_params):
                 if isinstance(arg, bool):
                     sampler_end_idx = i + 1
                 else:
                     break
             
-            sampler_checkboxes = remaining_after_sampler[:sampler_end_idx] if sampler_end_idx > 0 else []
-            other_params = remaining_after_sampler[sampler_end_idx:]
+            sampler_checkboxes = remaining_params[:sampler_end_idx] if sampler_end_idx > 0 else []
+            other_params = remaining_params[sampler_end_idx:]
             
             # Extract parameters in expected order
             if len(other_params) >= 10:
@@ -701,7 +1396,6 @@ def generate_dual_model_comparison(
                 inpaint_audio = None
         else:
             # Fallback for insufficient parameters
-            default_sampler_type = "dpmpp-3m-sde"
             sampler_checkboxes = []
             seed_input = "-1"
             seconds_start = 0
@@ -724,7 +1418,6 @@ def generate_dual_model_comparison(
         # Fallback defaults
         model_a_active = False
         model_b_active = False
-        default_sampler_type = "dpmpp-3m-sde"
         sampler_checkboxes = []
         seed_input = "-1"
         seconds_start = 0
@@ -756,12 +1449,13 @@ def generate_dual_model_comparison(
         sigma_max_values = [float(x.strip()) for x in sigma_max_list.split(',') if x.strip()]
         
         # Get selected samplers from checkboxes or use default
-        samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2"]
+        samplers = ["dpmpp-2m-sde", "dpmpp-3m-sde", "dpmpp-2m", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-adaptive", "k-dpm-fast", "v-ddim", "v-ddim-cfgpp"]
         selected_samplers = [samplers[i] for i, selected in enumerate(sampler_checkboxes) if selected and i < len(samplers)]
         
-        # If no samplers are selected from checkboxes, use the default sampler
+        # Validate that at least one sampler is selected
         if not selected_samplers:
-            selected_samplers = [default_sampler_type]
+            error_msg = "Error: No samplers selected. Please select at least one sampler from the checkboxes."
+            return None, None, None, None, error_msg, error_msg
             
     except ValueError as e:
         return None, None, None, None, f"Error parsing parameters: {str(e)}", f"Error parsing parameters: {str(e)}"
@@ -776,177 +1470,173 @@ def generate_dual_model_comparison(
         sigma_min_values, sigma_max_values, selected_samplers
     ))
     
-    results_a = []
-    results_b = []
-    
     # Set seed
     seed = int(seed_input) if seed_input != "-1" else np.random.randint(0, 2**32 - 1)
     
-    # Generate with Model A if active
+    # Clear and setup global results storage for lazy loading
+    global current_results_a, current_results_b, current_index_a, current_index_b, generation_params_cache
+    global current_session_files, previous_session_files
+    
+    # Clean up files from previous session
+    cleanup_previous_session_files()
+    
+    # Move current files to previous and start new session
+    previous_session_files = current_session_files.copy()
+    current_session_files = []
+    
+    current_results_a = []
+    current_results_b = []
+    current_index_a = 0
+    current_index_b = 0
+    
+    # Common generation arguments
+    generation_args = {
+        'prompt': prompt,
+        'negative_prompt': negative_prompt,
+        'seconds_start': seconds_start,
+        'seconds_total': seconds_total,
+        'preview_every': preview_every,
+        'seed': seed,
+        'file_format': file_format,
+        'file_naming': file_naming,
+        'save_permanently': save_permanently,
+        'cut_to_seconds_total': cut_to_seconds_total,
+        'init_audio': init_audio,
+        'init_noise_level': init_noise_level,
+        'mask_maskstart': mask_maskstart,
+        'mask_maskend': mask_maskend,
+        'inpaint_audio': inpaint_audio,
+        'batch_size': batch_size,
+        'rho': rho,
+        'cfg_interval_min': cfg_interval_min,
+        'cfg_interval_max': cfg_interval_max
+    }
+    
+    # Setup Model A results (lazy loading metadata only)
     if model_a_active and model_a_loaded:
         for i, (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler) in enumerate(param_combinations):
+            # Create metadata entry for lazy loading
+            param_text = create_param_description(steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler, seed)
+            cache_key = f"ModelA_{i:03d}_{seed}_{steps}_{cfg}_{cfg_rescale}_{sigma_min}_{sigma_max}_{sampler}"
+            
+            # Store generation parameters for lazy loading
+            generation_params_cache[cache_key] = {
+                'model': model_a,
+                'model_config': model_a_config,
+                'model_prefix': 'ModelA',
+                'generation_args': generation_args
+            }
+            
+            # Add result placeholder with metadata
+            current_results_a.append({
+                'audio': None,  # Will be loaded lazily
+                'spectrogram': None,  # Will be loaded lazily
+                'params': param_text,
+                'param_combo': (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler),
+                'cache_key': cache_key,
+                'index': i
+            })
+            
+            # Generate ALL results immediately for bracketing (files rendered at once)
             try:
-                # Use the diffusion_cond generation from the existing interface
-                from .interfaces.diffusion_cond import generate_cond
-                
-                # Temporarily set global model to model_a
-                global model, model_type, sample_rate, sample_size
-                old_model = model
-                old_model_type = model_type
-                old_sample_rate = sample_rate
-                old_sample_size = sample_size
-                
-                model = model_a
-                model_type = model_a_config["model_type"]
-                sample_rate = model_a_config["sample_rate"]
-                sample_size = model_a_config["sample_size"]
-                
-                # Generate unique filename
-                base_params = {
-                    "prompt": prompt,
-                    "steps": steps,
-                    "cfg_scale": cfg,
-                    "cfg_rescale": cfg_rescale,
-                    "sigma_min": sigma_min,
-                    "sigma_max": sigma_max,
-                    "sampler": sampler,
-                    "model_name": f"ModelA_{i:03d}"
-                }
-                
-                filename = generate_unique_filename(
-                    base_params=base_params,
-                    seed=seed,
-                    naming_style="detailed"
+                audio_file, spectrogram = generate_audio_lazy(
+                    (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler),
+                    model_a, model_a_config, 'ModelA', generation_args
                 )
-                
-                # Call model-specific generation function
-                audio_file, spectrogram = generate_cond_with_model(
-                    model=model_a,
-                    model_type=model_a_config["model_type"],
-                    sample_rate=model_a_config["sample_rate"],
-                    sample_size=model_a_config["sample_size"],
-                    model_prefix="ModelA",
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    seconds_start=seconds_start,
-                    seconds_total=seconds_total,
-                    cfg_scale=cfg,
-                    steps=steps,
-                    preview_every=preview_every,
-                    seed=seed,
-                    sampler_type=sampler,
-                    sigma_min=sigma_min,
-                    sigma_max=sigma_max,
-                    rho=rho,
-                    cfg_interval_min=cfg_interval_min,
-                    cfg_interval_max=cfg_interval_max,
-                    cfg_rescale=cfg_rescale,
-                    file_format=file_format,
-                    file_naming=file_naming,
-                    save_permanently=save_permanently,
-                    cut_to_seconds_total=cut_to_seconds_total,
-                    init_audio=init_audio,
-                    init_noise_level=init_noise_level,
-                    mask_maskstart=mask_maskstart,
-                    mask_maskend=mask_maskend,
-                    inpaint_audio=inpaint_audio,
-                    batch_size=batch_size
-                )
-                
-                # Store parameters for display
-                param_text = f"Steps: {steps}, CFG: {cfg}, CFG Rescale: {cfg_rescale}, Sigma: {sigma_min}-{sigma_max}, Sampler: {sampler}, Seed: {seed}"
-                
-                results_a.append({
-                    'audio': audio_file,
-                    'spectrogram': spectrogram,
-                    'params': param_text,
-                    'filename': filename
-                })
-                
+                current_results_a[i]['audio'] = audio_file
+                current_results_a[i]['spectrogram'] = spectrogram
             except Exception as e:
-                print(f"Error generating with Model A: {str(e)}")
-                continue
+                print(f"Error generating Model A result {i}: {str(e)}")
     
-    # Generate with Model B if active (similar logic)
+    # Setup Model B results (lazy loading metadata only)
     if model_b_active and model_b_loaded:
         for i, (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler) in enumerate(param_combinations):
+            # Create metadata entry for lazy loading
+            param_text = create_param_description(steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler, seed)
+            cache_key = f"ModelB_{i:03d}_{seed}_{steps}_{cfg}_{cfg_rescale}_{sigma_min}_{sigma_max}_{sampler}"
+            
+            # Store generation parameters for lazy loading
+            generation_params_cache[cache_key] = {
+                'model': model_b,
+                'model_config': model_b_config,
+                'model_prefix': 'ModelB',
+                'generation_args': generation_args
+            }
+            
+            # Add result placeholder with metadata
+            current_results_b.append({
+                'audio': None,  # Will be loaded lazily
+                'spectrogram': None,  # Will be loaded lazily
+                'params': param_text,
+                'param_combo': (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler),
+                'cache_key': cache_key,
+                'index': i
+            })
+            
+            # Generate ALL results immediately for bracketing (files rendered at once)
             try:
-                # Generate unique filename
-                base_params = {
-                    "prompt": prompt,
-                    "steps": steps,
-                    "cfg_scale": cfg,
-                    "cfg_rescale": cfg_rescale,
-                    "sigma_min": sigma_min,
-                    "sigma_max": sigma_max,
-                    "sampler": sampler,
-                    "model_name": f"ModelB_{i:03d}"
-                }
-                
-                filename = generate_unique_filename(
-                    base_params=base_params,
-                    seed=seed,
-                    naming_style="detailed"
+                audio_file, spectrogram = generate_audio_lazy(
+                    (steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler),
+                    model_b, model_b_config, 'ModelB', generation_args
                 )
-                
-                # Call model-specific generation function for Model B
-                audio_file, spectrogram = generate_cond_with_model(
-                    model=model_b,
-                    model_type=model_b_config["model_type"],
-                    sample_rate=model_b_config["sample_rate"],
-                    sample_size=model_b_config["sample_size"],
-                    model_prefix="ModelB",
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    seconds_start=seconds_start,
-                    seconds_total=seconds_total,
-                    cfg_scale=cfg,
-                    steps=steps,
-                    preview_every=preview_every,
-                    seed=seed,
-                    sampler_type=sampler,
-                    sigma_min=sigma_min,
-                    sigma_max=sigma_max,
-                    rho=rho,
-                    cfg_interval_min=cfg_interval_min,
-                    cfg_interval_max=cfg_interval_max,
-                    cfg_rescale=cfg_rescale,
-                    file_format=file_format,
-                    file_naming=file_naming,
-                    save_permanently=save_permanently,
-                    cut_to_seconds_total=cut_to_seconds_total,
-                    init_audio=init_audio,
-                    init_noise_level=init_noise_level,
-                    mask_maskstart=mask_maskstart,
-                    mask_maskend=mask_maskend,
-                    inpaint_audio=inpaint_audio,
-                    batch_size=batch_size
-                )
-                
-                # Store parameters for display
-                param_text = f"Steps: {steps}, CFG: {cfg}, CFG Rescale: {cfg_rescale}, Sigma: {sigma_min}-{sigma_max}, Sampler: {sampler}, Seed: {seed}"
-                
-                results_b.append({
-                    'audio': audio_file,
-                    'spectrogram': spectrogram,
-                    'params': param_text,
-                    'filename': filename
-                })
-                
+                current_results_b[i]['audio'] = audio_file
+                current_results_b[i]['spectrogram'] = spectrogram
             except Exception as e:
-                print(f"Error generating with Model B: {str(e)}")
-                continue
+                print(f"Error generating Model B result {i}: {str(e)}")
     
-    # Return first results for display
-    audio_a = results_a[0]['audio'] if results_a else None
-    spec_a = results_a[0]['spectrogram'] if results_a else None
-    params_a = results_a[0]['params'] if results_a else "No Model A results"
+    # Return first results for display (now using lazy loading system)
+    audio_a = current_results_a[0]['audio'] if current_results_a else None
+    spec_a = current_results_a[0]['spectrogram'] if current_results_a else None
+    if current_results_a:
+        base_params_a = current_results_a[0]['params']
+        total_a = len(current_results_a)
+        params_a = f"[1/{total_a}] {base_params_a}"
+    else:
+        params_a = "No Model A results"
     
-    audio_b = results_b[0]['audio'] if results_b else None
-    spec_b = results_b[0]['spectrogram'] if results_b else None
-    params_b = results_b[0]['params'] if results_b else "No Model B results"
+    audio_b = current_results_b[0]['audio'] if current_results_b else None
+    spec_b = current_results_b[0]['spectrogram'] if current_results_b else None
+    if current_results_b:
+        base_params_b = current_results_b[0]['params']
+        total_b = len(current_results_b)
+        params_b = f"[1/{total_b}] {base_params_b}"
+    else:
+        params_b = "No Model B results"
     
-    return audio_a, spec_a, audio_b, spec_b, params_a, params_b
+    # Generate CFG visualizations for first results
+    if current_results_a:
+        steps_a, cfg_a, cfg_rescale_a, sigma_min_a, sigma_max_a, sampler_a = current_results_a[0]['param_combo']
+        cfg_viz_a = create_cfg_interval_visualization(
+            steps=int(steps_a),
+            cfg_interval_min=cfg_interval_min,
+            cfg_interval_max=cfg_interval_max,
+            sigma_min=float(sigma_min_a),
+            sigma_max=float(sigma_max_a),
+            rho=rho,
+            sampler_type=sampler_a
+        )
+    else:
+        cfg_viz_a = None
+    
+    if current_results_b:
+        steps_b, cfg_b, cfg_rescale_b, sigma_min_b, sigma_max_b, sampler_b = current_results_b[0]['param_combo']
+        cfg_viz_b = create_cfg_interval_visualization(
+            steps=int(steps_b),
+            cfg_interval_min=cfg_interval_min,
+            cfg_interval_max=cfg_interval_max,
+            sigma_min=float(sigma_min_b),
+            sigma_max=float(sigma_max_b),
+            rho=rho,
+            sampler_type=sampler_b
+        )
+    else:
+        cfg_viz_b = None
+    
+    # Create dropdown choices 
+    dropdown_choices_a = [result['params'] for result in current_results_a] if current_results_a else []
+    dropdown_choices_b = [result['params'] for result in current_results_b] if current_results_b else []
+    
+    return audio_a, cfg_viz_a, spec_a, audio_b, cfg_viz_b, spec_b, params_a, params_b, dropdown_choices_a, dropdown_choices_b
 
 def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_prefix, **kwargs):
     """
@@ -1192,17 +1882,31 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
         cmd = f"ffmpeg -i \"{output_wav}\" -b:a 128k -y \"{output_filename}\""
     elif file_format == "mp3 v0":
         cmd = f"ffmpeg -i \"{output_wav}\" -q:a 0 -y \"{output_filename}\""
+    elif file_format == "ogg 192k":
+        cmd = f"ffmpeg -i \"{output_wav}\" -c:a libvorbis -b:a 192k -y \"{output_filename}\""
+    elif file_format == "ogg 96k":
+        cmd = f"ffmpeg -i \"{output_wav}\" -c:a libvorbis -b:a 96k -y \"{output_filename}\""
         
     if cmd:
         cmd += " -loglevel error"
-        subprocess.run(cmd, shell=True, check=True)
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Audio conversion failed for format '{file_format}'. Using WAV instead.")
+            print(f"Error: {e}")
+            # Fall back to WAV if conversion fails
+            output_filename = output_wav
+        except Exception as e:
+            print(f"Unexpected error during audio conversion: {e}")
+            output_filename = output_wav
     
     # Generate spectrogram
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
 
-    # Clean up files after delay (only if not saving permanently)
+    # Track files for session-based cleanup (only if not saving permanently)
     if not save_permanently and file_naming in ["verbose", "prompt"]:
-        delete_files_async([output_wav, output_filename], 30)
+        global current_session_files
+        current_session_files.extend([output_wav, output_filename])
     
     # Create outputs folder if saving permanently and doesn't exist
     if save_permanently:
@@ -1555,6 +2259,9 @@ def create_lm_ui(model_config):
     return ui
 
 def create_ui(model_config_path=None, ckpt_path=None, ckpt_files=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, gradio_title=""):
+    # Initialize startup timing
+    log_startup_phase("Initializing Stable Audio Tools")
+    
     # Load gradio configuration and scan for models/configs
     global available_models, available_configs
     load_gradio_config()
@@ -1565,6 +2272,7 @@ def create_ui(model_config_path=None, ckpt_path=None, ckpt_files=None, pretraine
     
     # Only load initial model if provided via legacy method
     if pretrained_name is not None or (model_config_path is not None and ckpt_path is not None):
+        log_startup_phase("Loading initial model")
         if model_config_path is not None:
             # Load config from json file
             with open(model_config_path) as f:
@@ -1588,17 +2296,27 @@ def create_ui(model_config_path=None, ckpt_path=None, ckpt_files=None, pretraine
         }
     
     # Create tabbed interface with multi-model support
+    log_startup_phase("Building Gradio interface")
+    
     with gr.Blocks(theme=gr.themes.Base()) as ui:
         if gradio_title:
             gr.Markdown("### %s" % gradio_title)
         
         # Dual model selection interface at top
+        log_startup_phase("Creating model selection interface")
         model_a_active, model_b_active, model_a_half, model_b_half = create_dual_model_interface()
         
         # Main sampling interface
+        log_startup_phase("Setting up main interface")
         create_comparison_sampling_ui(model_a_active, model_b_active)
         
         # Tooltips section at bottom
+        log_startup_phase("Adding help and tooltips")
         create_tooltips_section()
         
+        log_startup_phase("Finalizing interface")
+    
+    # Startup complete
+    finish_startup()
+    
     return ui

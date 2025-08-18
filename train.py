@@ -10,6 +10,19 @@ from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict, remove_weight_norm_from_model
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
 
+#Enable tensor cores
+torch.set_float32_matmul_precision('high')
+
+# Enable memory efficient attention
+torch.backends.cuda.enable_flash_sdp(True)
+
+# Optimize CUDA graphs for repetitive operations
+torch.cuda.empty_cache()
+torch._dynamo.config.cache_size_limit = 1024
+
+# Enable cuDNN benchmarking
+torch.backends.cudnn.benchmark = True
+
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
         print(f'{type(err).__name__}: {err}')
