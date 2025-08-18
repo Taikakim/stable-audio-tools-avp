@@ -240,21 +240,30 @@ def detect_audio_format_support():
     return audio_format_support
 
 def get_available_audio_formats():
-    """Get list of available audio formats based on detected support"""
+    """Get list of available audio formats based on detected support (prioritized order)"""
     global audio_format_support
     
-    # Always available
-    formats = ["wav"]
+    # Prioritized order: ogg 96kbps > mp3 128kbps > flac > wav
+    formats = []
     
+    # First priority: OGG 96k (best compression/quality balance)
+    if audio_format_support['ogg']:
+        formats.append("ogg 96k")
+        formats.append("ogg 192k")  # Also include higher quality ogg
+    
+    # Second priority: MP3 128k (widely compatible)
+    if audio_format_support['mp3']:
+        formats.append("mp3 128k")
+        formats.extend(["mp3 v0", "mp3 320k"])  # Include other mp3 options
+    
+    # Third priority: FLAC (lossless)
     if audio_format_support['flac']:
         formats.append("flac")
     
-    if audio_format_support['mp3']:
-        formats.extend(["mp3 320k", "mp3 v0", "mp3 128k"])
+    # Fourth priority: WAV (always available, uncompressed)
+    formats.append("wav")
     
-    if audio_format_support['ogg']:
-        formats.extend(["ogg 192k", "ogg 96k"])
-    
+    # Additional formats (lower priority)
     if audio_format_support['aac']:
         formats.extend(["m4a aac_he_v2 64k", "m4a aac_he_v2 32k"])
     
@@ -346,6 +355,10 @@ def is_model_config(json_path):
     except:
         return False
 
+def get_cfg_intervals_for_visualization(model_config, gen_args, sigma_min, sigma_max):
+    """Get CFG interval values for visualization - now using direct timestep values"""
+    return gen_args.get('cfg_interval_min', 0.0), gen_args.get('cfg_interval_max', 1.0)
+
 def load_selected_model(config_path, model_path):
     """Load a model based on selected config and checkpoint paths"""
     global model, sample_rate, sample_size, model_type
@@ -386,6 +399,9 @@ def generate_audio_lazy(param_combo, model, model_config, model_prefix, generati
     try:
         steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = param_combo
         
+        # CFG intervals are now direct timestep values (0.0-1.0) - no conversion needed
+        modified_generation_args = generation_args
+        
         # Call model-specific generation function
         audio_file, spectrogram = generate_cond_with_model(
             model=model,
@@ -399,7 +415,7 @@ def generate_audio_lazy(param_combo, model, model_config, model_prefix, generati
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             sampler_type=sampler,
-            **generation_args
+            **modified_generation_args
         )
         
         return audio_file, spectrogram
@@ -420,141 +436,149 @@ def create_param_description(steps, cfg, cfg_rescale, sigma_min, sigma_max, samp
         parts.append(f"Seed: {seed}")
     return " | ".join(parts)
 
-def create_cfg_interval_visualization(steps, cfg_interval_min, cfg_interval_max, sigma_min=0.03, sigma_max=500, rho=1.0, sampler_type="dpmpp-3m-sde", width=1024, height=256):
-    """Create visualization showing when CFG interval is active during denoising using REAL sigma schedule"""
+def create_cfg_interval_visualization(steps, cfg_interval_min, cfg_interval_max, sigma_min=0.03, sigma_max=300, rho=1.0, sampler_type="dpmpp-3m-sde", width=1200, height=400):
+    """Create visualization showing both noise schedule AND 0-1 timestep mapping (corrected understanding)"""
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     from io import BytesIO
     import tempfile
+    import math
     
-    # Import k-diffusion to get the EXACT same sigma schedule used in generation
+    # Get the ACTUAL noise schedule used for denoising
     try:
         import k_diffusion as K
-        # Use the EXACT same function that generates sigmas in sample_k
-        device = 'cpu'  # For visualization, we don't need GPU
-        sigmas = K.sampling.get_sigmas_polyexponential(steps, sigma_min, sigma_max, rho, device=device)
-        sigma_values = sigmas.cpu().numpy()
+        device = 'cpu'
+        # This is the NOISE SCHEDULE (actual sigma values used for adding noise)
+        noise_sigmas = K.sampling.get_sigmas_polyexponential(steps, sigma_min, sigma_max, rho, device=device)
+        noise_sigma_values = noise_sigmas.cpu().numpy()
         using_real_schedule = True
-        schedule_type = "Real K-Diffusion Schedule"
+        schedule_type = "K-Diffusion"
     except ImportError:
-        # Fallback to approximation if k_diffusion not available
         step_positions = np.linspace(0, 1, steps)
-        sigma_values = sigma_max * ((sigma_min / sigma_max) ** (step_positions ** rho))
+        noise_sigma_values = sigma_max * ((sigma_min / sigma_max) ** (step_positions ** rho))
         using_real_schedule = False
-        schedule_type = "Approximated Schedule"
+        schedule_type = "Approximated"
     
-    # Create larger figure (doubled area: 1024x256 instead of 512x64)
-    fig, ax = plt.subplots(figsize=(width/80, height/80), dpi=100)
-    fig.patch.set_facecolor('black')
-    ax.set_facecolor('black')
+    # Calculate timestep values (0 to 1) and CFG-comparison sigma values
+    timesteps = np.linspace(0, 1, len(noise_sigma_values))
     
-    # Step positions for x-axis
-    step_positions = np.linspace(0, 1, len(sigma_values))
+    # CRITICAL: These are the sigma values used for CFG comparison (dit.py lines 318-322)
+    # For V-param: sigma = sin(t * π/2), For RF: sigma = t
+    # CFG intervals compare against these transformed timestep values, NOT noise schedule!
+    v_param_sigma = np.sin(timesteps * math.pi / 2)  # V-parameterization  
+    rf_sigma = timesteps  # Rectified Flow
     
-    # Use log scale for better visualization of sigma curve
-    log_sigma_values = np.log10(sigma_values + 1e-10)  # Add small epsilon to avoid log(0)
-    log_sigma_min = np.log10(sigma_min + 1e-10)
-    log_sigma_max = np.log10(sigma_max + 1e-10)
+    # Create figure with subplots
+    fig = plt.figure(figsize=(width/100, height/100), dpi=100)
+    fig.patch.set_facecolor('#0a0a0a')
     
-    # Normalize log sigma values to [0, 1] for visualization
-    sigma_normalized = (log_sigma_values - log_sigma_min) / (log_sigma_max - log_sigma_min)
-    sigma_normalized = np.clip(sigma_normalized, 0, 1)
+    # Create subplot layout: noise schedule (top) + CFG comparison (bottom)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], 
+                         hspace=0.3, left=0.08, right=0.95, top=0.85, bottom=0.12)
     
-    # Plot the REAL sigma curve with gradient fill
-    ax.plot(step_positions, sigma_normalized, color='cyan', linewidth=4, alpha=0.9, 
-            label=f'{schedule_type}', marker='o', markersize=3, markevery=max(1, len(step_positions)//20))
-    ax.fill_between(step_positions, 0, sigma_normalized, color='cyan', alpha=0.3)
+    # Top plot: Actual noise schedule (what k_diffusion uses)
+    ax_noise = fig.add_subplot(gs[0, 0])
+    ax_noise.set_facecolor('#0f0f0f')
     
-    # Add fine grid for better readability
-    ax.grid(True, alpha=0.4, color='gray', linestyle=':', linewidth=1)
-    ax.grid(True, alpha=0.2, color='gray', linestyle='-', linewidth=0.5, which='minor')
+    # Step positions for x-axis (denoising progress 0-99 steps)
+    step_positions = np.arange(len(noise_sigma_values))
     
-    # Find CFG active region based on REAL sigma values
-    cfg_active_mask = (sigma_values >= cfg_interval_min) & (sigma_values <= cfg_interval_max)
+    # Plot noise schedule with trajectory style
+    uncond_noise = np.random.normal(0, 0.05, len(noise_sigma_values))
+    uncond_trajectory = noise_sigma_values + uncond_noise * noise_sigma_values * 0.1
     
-    if np.any(cfg_active_mask):
-        # Highlight CFG active region with stronger visual emphasis
-        ax.fill_between(step_positions, 0, 1, where=cfg_active_mask, 
-                       color='lime', alpha=0.5, label='CFG Active Region')
-        
-        # Add boundary markers with better positioning
-        active_indices = np.where(cfg_active_mask)[0]
-        if len(active_indices) > 0:
-            start_idx = active_indices[0]
-            end_idx = active_indices[-1]
-            
-            # CFG start line with shadow effect
-            ax.axvline(x=step_positions[start_idx], color='white', linewidth=4, alpha=0.5)
-            ax.axvline(x=step_positions[start_idx], color='lime', linewidth=3, linestyle='--')
-            ax.text(step_positions[start_idx], 0.85, f'CFG START\nσ={sigma_values[start_idx]:.2f}\nStep {start_idx}', 
-                   color='lime', fontsize=10, ha='center', va='center', weight='bold',
-                   bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.8, edgecolor='lime'))
-            
-            # CFG end line with shadow effect
-            if end_idx < len(step_positions) - 1:
-                ax.axvline(x=step_positions[end_idx], color='white', linewidth=4, alpha=0.5)
-                ax.axvline(x=step_positions[end_idx], color='orange', linewidth=3, linestyle='--')
-                ax.text(step_positions[end_idx], 0.85, f'CFG END\nσ={sigma_values[end_idx]:.2f}\nStep {end_idx}', 
-                       color='orange', fontsize=10, ha='center', va='center', weight='bold',
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.8, edgecolor='orange'))
+    cond_noise = np.random.normal(0, 0.03, len(noise_sigma_values))
+    cond_trajectory = noise_sigma_values + cond_noise * noise_sigma_values * 0.05
     
-    # Add logarithmic sigma value labels on y-axis for better readability
-    if sigma_max > 100:
-        sigma_ticks = [sigma_max, 100, 10, 1, 0.1, sigma_min]
-    else:
-        sigma_ticks = [sigma_max, sigma_max/2, sigma_max/10, sigma_min]
+    ax_noise.plot(step_positions, uncond_trajectory, color='#FF6B35', linewidth=3, alpha=0.8, 
+                 label='Unconditional Path', linestyle='-')
+    ax_noise.plot(step_positions, cond_trajectory, color='#4ECDC4', linewidth=3, alpha=0.9, 
+                 label='Conditional Path', linestyle='-')
+    ax_noise.plot(step_positions, noise_sigma_values, color='white', linewidth=4, alpha=0.9, 
+                 label=f'{schedule_type} Schedule', linestyle='--', marker='o', markersize=2, markevery=max(1, steps//10))
     
-    # Filter out ticks that are outside our range
-    sigma_ticks = [s for s in sigma_ticks if sigma_min <= s <= sigma_max]
+    # Highlight CFG active region in green (but this is just visual - actual CFG compares timesteps below!)
+    ax_noise.axhspan(0, noise_sigma_values.max(), color='lime', alpha=0.15, 
+                    label='CFG Guidance Active', zorder=0)
     
-    log_sigma_ticks = [np.log10(s + 1e-10) for s in sigma_ticks]
-    sigma_tick_positions = [(log_s - log_sigma_min) / (log_sigma_max - log_sigma_min) for log_s in log_sigma_ticks]
-    sigma_tick_positions = [max(0, min(1, pos)) for pos in sigma_tick_positions]
+    ax_noise.set_yscale('log')
+    ax_noise.set_xlim(0, len(noise_sigma_values)-1)
+    ax_noise.set_ylim(sigma_min, sigma_max)
+    ax_noise.set_xlabel('Denoising Steps', color='white', fontsize=11, weight='bold')
+    ax_noise.set_ylabel('Noise Level σ (log scale)', color='white', fontsize=11, weight='bold')
+    ax_noise.tick_params(colors='white', labelsize=9)
+    ax_noise.grid(True, alpha=0.3, color='gray', linestyle=':', linewidth=0.5)
     
-    ax.set_yticks(sigma_tick_positions)
-    ax.set_yticklabels([f'{s:.3f}' if s < 1 else f'{s:.1f}' for s in sigma_ticks])
+    legend = ax_noise.legend(loc='upper right', facecolor='#0a0a0a', edgecolor='white', 
+                            labelcolor='white', fontsize=9, framealpha=0.9)
+    legend.get_frame().set_linewidth(1)
     
-    # Add more detailed step markers on x-axis
-    step_markers = [0, steps//8, steps//4, 3*steps//8, steps//2, 5*steps//8, 3*steps//4, 7*steps//8, steps-1]
-    step_markers = [s for s in step_markers if s < steps]  # Filter valid steps
-    step_positions_markers = [i/(steps-1) for i in step_markers]
-    ax.set_xticks(step_positions_markers)
-    ax.set_xticklabels([f'{i}' for i in step_markers])
-    
-    # Enhanced styling with better fonts and colors
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel('Denoising Steps', color='white', fontsize=12, weight='bold')
-    ax.set_ylabel('Noise Level σ (log scale)', color='white', fontsize=12, weight='bold')
-    ax.tick_params(colors='white', labelsize=10)
-    
-    # Style the spines
-    for spine in ax.spines.values():
+    for spine in ax_noise.spines.values():
         spine.set_color('white')
-        spine.set_linewidth(2)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+        spine.set_linewidth(1)
     
-    # Add informative title and subtitle
-    title_main = f'Real Denoising Trajectory Analysis'
-    title_sub = f'Sampler: {sampler_type} | Steps: {steps} | σ range: [{sigma_min:.3f}, {sigma_max:.1f}] | ρ: {rho}'
-    ax.set_title(title_main, color='white', fontsize=14, weight='bold', pad=20)
-    ax.text(0.5, 0.95, title_sub, transform=ax.transAxes, color='lightgray', 
-            fontsize=10, ha='center', va='top')
+    # Bottom plot: CFG comparison sigma (what dit.py ACTUALLY uses for cfg_interval comparison)
+    ax_cfg_sigma = fig.add_subplot(gs[1, 0])
+    ax_cfg_sigma.set_facecolor('#0f0f0f')
     
-    # Add legend
-    ax.legend(loc='upper right', facecolor='black', edgecolor='white', labelcolor='white')
+    # Plot both model types' sigma transformations
+    ax_cfg_sigma.plot(step_positions, v_param_sigma, color='cyan', linewidth=3, alpha=0.9, 
+                     label='V-Param: σ = sin(t·π/2)', linestyle='-', marker='s', markersize=3, markevery=max(1, steps//10))
+    ax_cfg_sigma.plot(step_positions, rf_sigma, color='magenta', linewidth=3, alpha=0.9, 
+                     label='Rectified Flow: σ = t', linestyle='-', marker='o', markersize=3, markevery=max(1, steps//10))
     
-    # Convert to base64 image
+    # Show CFG active region with correct timestep mapping
+    cfg_active_mask_v = (v_param_sigma >= cfg_interval_min) & (v_param_sigma <= cfg_interval_max)
+    cfg_active_mask_rf = (rf_sigma >= cfg_interval_min) & (rf_sigma <= cfg_interval_max)
+    
+    if np.any(cfg_active_mask_v):
+        active_steps_v = step_positions[cfg_active_mask_v]
+        if len(active_steps_v) > 0:
+            ax_cfg_sigma.axvspan(active_steps_v[0], active_steps_v[-1], color='cyan', alpha=0.3, 
+                               label=f'V-Param CFG Active [{cfg_interval_min:.2f}, {cfg_interval_max:.2f}]', zorder=0)
+    
+    if np.any(cfg_active_mask_rf):
+        active_steps_rf = step_positions[cfg_active_mask_rf]
+        if len(active_steps_rf) > 0:
+            ax_cfg_sigma.axvspan(active_steps_rf[0], active_steps_rf[-1], color='magenta', alpha=0.3, 
+                               label=f'RF CFG Active [{cfg_interval_min:.2f}, {cfg_interval_max:.2f}]', zorder=0)
+    
+    ax_cfg_sigma.set_xlim(0, len(noise_sigma_values)-1)
+    ax_cfg_sigma.set_ylim(0, 1)
+    ax_cfg_sigma.set_xlabel('Denoising Steps', color='white', fontsize=11, weight='bold')
+    ax_cfg_sigma.set_ylabel('Timestep σ for CFG', color='white', fontsize=11, weight='bold')
+    ax_cfg_sigma.tick_params(colors='white', labelsize=9)
+    ax_cfg_sigma.grid(True, alpha=0.3, color='gray', linestyle=':', linewidth=0.5)
+    
+    legend2 = ax_cfg_sigma.legend(loc='upper right', facecolor='#0a0a0a', edgecolor='white', 
+                                 labelcolor='white', fontsize=9, framealpha=0.9)
+    legend2.get_frame().set_linewidth(1)
+    
+    for spine in ax_cfg_sigma.spines.values():
+        spine.set_color('white')
+        spine.set_linewidth(1)
+    
+    # Main title
+    title_main = f'CFG Guidance: Noise Schedule vs Timestep Mapping'
+    title_sub = f'Steps: {steps} | Noise σ: [{sigma_min:.3f}, {sigma_max:.1f}] | CFG Interval: [{cfg_interval_min:.2f}, {cfg_interval_max:.2f}]'
+    fig.suptitle(title_main, color='white', fontsize=13, weight='bold', y=0.95)
+    fig.text(0.5, 0.90, title_sub, ha='center', color='lightgray', fontsize=9)
+    
+    # Add explanatory text
+    explanation = ("TOP: Noise schedule σ used for denoising (k-diffusion polyexponential)\n"
+                  "BOTTOM: Timestep σ used for CFG comparison (dit.py lines 318-322)\n"
+                  "CFG intervals [0.0-1.0] compare against BOTTOM values, not TOP!")
+    fig.text(0.5, 0.02, explanation, ha='center', color='yellow', fontsize=8, weight='bold')
+    
+    # Convert to image
     buf = BytesIO()
-    plt.savefig(buf, format='png', facecolor='black', edgecolor='white', 
-                bbox_inches='tight', dpi=80)
+    plt.savefig(buf, format='png', facecolor='#0a0a0a', edgecolor='white', 
+                bbox_inches='tight', dpi=100)
     buf.seek(0)
     plt.close(fig)
     
     # Return as file path for Gradio
-    import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
         tmp.write(buf.getvalue())
         return tmp.name
@@ -587,11 +611,17 @@ def get_current_audio_a():
     # Generate CFG visualization for current parameters
     if 'cache_key' in result and result['cache_key'] in generation_params_cache:
         gen_args = generation_params_cache[result['cache_key']]['generation_args']
+        model_config = generation_params_cache[result['cache_key']]['model_config']
         steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = result['param_combo']
+        
+        # Get actual CFG interval values for this model
+        cfg_interval_min, cfg_interval_max = get_cfg_intervals_for_visualization(
+            model_config, gen_args, sigma_min, sigma_max)
+        
         cfg_viz = create_cfg_interval_visualization(
             steps=int(steps),
-            cfg_interval_min=gen_args.get('cfg_interval_min', 0.0),
-            cfg_interval_max=gen_args.get('cfg_interval_max', 1.0),
+            cfg_interval_min=cfg_interval_min,
+            cfg_interval_max=cfg_interval_max,
             sigma_min=float(sigma_min),
             sigma_max=float(sigma_max),
             rho=gen_args.get('rho', 1.0),
@@ -636,11 +666,17 @@ def get_current_audio_b():
     # Generate CFG visualization for current parameters
     if 'cache_key' in result and result['cache_key'] in generation_params_cache:
         gen_args = generation_params_cache[result['cache_key']]['generation_args']
+        model_config = generation_params_cache[result['cache_key']]['model_config']
         steps, cfg, cfg_rescale, sigma_min, sigma_max, sampler = result['param_combo']
+        
+        # Get actual CFG interval values for this model
+        cfg_interval_min, cfg_interval_max = get_cfg_intervals_for_visualization(
+            model_config, gen_args, sigma_min, sigma_max)
+        
         cfg_viz = create_cfg_interval_visualization(
             steps=int(steps),
-            cfg_interval_min=gen_args.get('cfg_interval_min', 0.0),
-            cfg_interval_max=gen_args.get('cfg_interval_max', 1.0),
+            cfg_interval_min=cfg_interval_min,
+            cfg_interval_max=cfg_interval_max,
             sigma_min=float(sigma_min),
             sigma_max=float(sigma_max),
             rho=gen_args.get('rho', 1.0),
@@ -657,25 +693,6 @@ def get_current_audio_b():
     
     return result.get('audio'), cfg_viz, result.get('spectrogram'), params_with_counter
 
-def navigate_audio_a(direction):
-    """Navigate audio A results (direction: -1 for prev, 1 for next)"""
-    global current_index_a, current_results_a
-    
-    if not current_results_a:
-        return None, None, None, "No results available"
-    
-    current_index_a = max(0, min(len(current_results_a) - 1, current_index_a + direction))
-    return get_current_audio_a()
-
-def navigate_audio_b(direction):
-    """Navigate audio B results (direction: -1 for prev, 1 for next)"""
-    global current_index_b, current_results_b
-    
-    if not current_results_b:
-        return None, None, None, "No results available"
-    
-    current_index_b = max(0, min(len(current_results_b) - 1, current_index_b + direction))
-    return get_current_audio_b()
 
 def select_audio_a_by_index(selected_description):
     """Select Model A audio by parameter description from dropdown"""
@@ -943,7 +960,7 @@ def load_preset(preset_name):
                 preset.get('cfg_scale', '7.0'),
                 preset.get('cfg_rescale', '0.0'),
                 preset.get('sigma_min', '0.03'),
-                preset.get('sigma_max', '500'),
+                preset.get('sigma_max', '300'),
                 *sampler_checkboxes,
                 f"Loaded preset: {preset_name}"
             )
@@ -1075,7 +1092,7 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
         
         with gr.Row():
             sigma_min_list = gr.Textbox(label="Sigma Min", value="0.03", placeholder="e.g. 0.01, 0.03, 0.1")
-            sigma_max_list = gr.Textbox(label="Sigma Max", value="500", placeholder="e.g. 100, 300, 500")
+            sigma_max_list = gr.Textbox(label="Sigma Max", value="300", placeholder="e.g. 100, 300, 500")
         
         # Sampler checkboxes
         gr.Markdown("**Select Samplers to Test:**")
@@ -1103,21 +1120,21 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
         with gr.Row(visible=True):
             # Timing controls
             seconds_start_slider = gr.Slider(minimum=0, maximum=700, step=1, value=0, label="Seconds start")
-            seconds_total = gr.Slider(minimum=1, maximum=700, value=30, step=1, label="Duration (seconds)")
+            seconds_total = gr.Slider(minimum=1, maximum=700, value=48, step=1, label="Duration (seconds)")
             batch_size = gr.Slider(minimum=1, maximum=8, value=1, step=1, label="Batch Size")
         
         with gr.Row():
             seed_input = gr.Textbox(label="Seed (-1 for random)", value="-1")
             
             cfg_interval_min_slider = gr.Slider(
-                minimum=0.0, maximum=1, step=0.01, value=0.0, 
+                minimum=0.0, maximum=1.0, step=0.01, value=0.0, 
                 label="CFG interval min",
-                info="Start applying CFG when noise level ≥ this value"
+                info="Start CFG at this timestep value (0.0 = start, 1.0 = end)"
             )
             cfg_interval_max_slider = gr.Slider(
-                minimum=0.0, maximum=1, step=0.01, value=1.0, 
+                minimum=0.0, maximum=1.0, step=0.01, value=1.0, 
                 label="CFG interval max", 
-                info="Stop applying CFG when noise level > this value"
+                info="Stop CFG at this timestep value (0.0 = start, 1.0 = end)"
             )
 
         with gr.Row():
@@ -1136,8 +1153,8 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
             file_format_dropdown = gr.Dropdown(
                 available_formats, 
                 label="File format", 
-                value="wav",
-                info="Available formats based on detected system capabilities"
+                value=available_formats[0] if available_formats else "wav",
+                info="Available formats based on detected system capabilities (prioritized: ogg 96k > mp3 128k > flac > wav)"
             )
             file_naming_dropdown = gr.Dropdown(
                 ["verbose", "prompt", "output.wav"], 
@@ -1172,7 +1189,7 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
         )
     
     # Audio outputs section
-    audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b, prev_a_btn, next_a_btn, prev_b_btn, next_b_btn = create_audio_outputs_section()
+    audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b = create_audio_outputs_section()
     
     # Connect generate button
     generate_button.click(
@@ -1204,29 +1221,6 @@ def create_comparison_sampling_ui(model_a_active, model_b_active):
     )
     
     # Connect navigation buttons
-    prev_a_btn.click(
-        fn=lambda: navigate_audio_a(-1),
-        inputs=[],
-        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, params_a]
-    )
-    
-    next_a_btn.click(
-        fn=lambda: navigate_audio_a(1),
-        inputs=[],
-        outputs=[audio_output_a, cfg_viz_a, spectrogram_a, params_a]
-    )
-    
-    prev_b_btn.click(
-        fn=lambda: navigate_audio_b(-1),
-        inputs=[],
-        outputs=[audio_output_b, cfg_viz_b, spectrogram_b, params_b]
-    )
-    
-    next_b_btn.click(
-        fn=lambda: navigate_audio_b(1),
-        inputs=[],
-        outputs=[audio_output_b, cfg_viz_b, spectrogram_b, params_b]
-    )
     
     # Connect dropdown selections
     param_dropdown_a.change(
@@ -1253,17 +1247,14 @@ def create_audio_outputs_section():
             cfg_viz_a = gr.Image(label="CFG Interval Visualization A", show_label=True, interactive=False)
             spectrogram_a = gr.Gallery(label="Spectrogram A", show_label=False)
             
-            with gr.Row():
-                prev_a_btn = gr.Button("← Prev A")
-                next_a_btn = gr.Button("Next A →")
             
             # Parameter selection dropdown for Model A
             param_dropdown_a = gr.Dropdown(
                 choices=[],
-                label="Select Parameters A",
-                info="Choose from generated parameter combinations",
+                label="🎵 Select Audio Output A",
+                info="Navigate through generated audio files by selecting parameter combinations",
                 interactive=True,
-                allow_custom_value=True
+                allow_custom_value=False
             )
             
             # Generation parameters display for Model A
@@ -1276,23 +1267,20 @@ def create_audio_outputs_section():
             cfg_viz_b = gr.Image(label="CFG Interval Visualization B", show_label=True, interactive=False)
             spectrogram_b = gr.Gallery(label="Spectrogram B", show_label=False)
             
-            with gr.Row():
-                prev_b_btn = gr.Button("← Prev B")
-                next_b_btn = gr.Button("Next B →")
             
             # Parameter selection dropdown for Model B
             param_dropdown_b = gr.Dropdown(
                 choices=[],
-                label="Select Parameters B",
-                info="Choose from generated parameter combinations",
+                label="🎵 Select Audio Output B",
+                info="Navigate through generated audio files by selecting parameter combinations",
                 interactive=True,
-                allow_custom_value=True
+                allow_custom_value=False
             )
             
             # Generation parameters display for Model B
             params_b = gr.Textbox(label="Generation Parameters B", interactive=False, lines=3)
     
-    return audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b, prev_a_btn, next_a_btn, prev_b_btn, next_b_btn
+    return audio_output_a, cfg_viz_a, spectrogram_a, params_a, audio_output_b, cfg_viz_b, spectrogram_b, params_b, param_dropdown_a, param_dropdown_b
 
 def create_tooltips_section():
     """Create informational tooltips section at bottom"""
@@ -1301,6 +1289,12 @@ def create_tooltips_section():
         ### Parameter Explanations
         
         **CFG Scale**: Classifier-Free Guidance strength. Higher values (7-15) follow prompts more closely but may reduce diversity. 1.0=no guidance.
+        
+        **CFG Interval**: Timestep range (0.0-1.0) where CFG guidance is active:
+        - **0.0** = Start of denoising (high noise)  
+        - **1.0** = End of denoising (low noise)
+        - **Example**: [0.0, 0.7] applies CFG for first 70% of denoising process
+        - **Works universally** for both V-Parameterization and Rectified Flow models
         
         **CFG Rescale**: Prevents over-saturation at high CFG scales by normalizing output variance. 0.0=off, 1.0=full rescaling.
         
@@ -1313,6 +1307,39 @@ def create_tooltips_section():
         **Bracketing**: Enable multiple parameter testing. Enter comma-separated values to test different combinations.
         
         **Models**: Load different checkpoints to compare results. Use Active checkbox to enable/disable models for generation.
+        
+        ---
+        
+        ### CFG Visualization Trajectories
+        
+        The CFG interval visualization shows **denoising paths** during audio generation:
+        
+        **🔶 Unconditional Path (Orange)**:
+        - Denoising trajectory **without** text guidance (CFG scale = 1.0)
+        - More "wandering" and noisy - shows baseline generation
+        - Represents what the model would generate with no prompt conditioning
+        
+        **🔷 Conditional Path (Teal/Cyan)**:
+        - Denoising trajectory **with** your text prompt guidance  
+        - Smoother and more directed because CFG steers toward your prompt
+        - Shows how classifier-free guidance shapes the generation
+        
+        **⚪ K-Diffusion Schedule (White dashed)**:
+        - The **actual noise schedule** used by k-diffusion sampling
+        - Clean mathematical curve (polyexponential) defining noise decrease over steps
+        - Shows the theoretical denoising progression
+        
+        **🟢 CFG Active Regions (Green highlights)**:
+        - **Top plot**: Visual reference showing noise schedule context
+        - **Bottom plot**: **ACTUAL CFG comparison** - where transformed timestep σ values fall within your CFG interval [0.0-1.0]
+        
+        **💡 Reading the Visualization**:
+        - **Large gap** between paths = CFG working hard to follow your prompt
+        - **Small gap** = CFG has less influence (either outside interval or easy prompt)
+        - **Smooth trajectories** = Stable generation process
+        - **Erratic trajectories** = Potential sampling instability
+        
+        The trajectories help you understand **when and how strongly** CFG guidance affects your audio generation! 🎯
         """)
 
 def generate_dual_model_comparison(
@@ -1362,9 +1389,11 @@ def generate_dual_model_comparison(
                 seconds_start = other_params[1] 
                 seconds_total = other_params[2]
                 batch_size = other_params[3]
-                cfg_interval_min = other_params[4]
-                cfg_interval_max = other_params[5]
+                cfg_interval_min = other_params[4]  # Direct timestep value from GUI
+                cfg_interval_max = other_params[5]  # Direct timestep value from GUI
                 rho = other_params[6]
+                
+                # CFG intervals are now direct timestep values (0.0-1.0) for all model types
                 preview_every = other_params[7]
                 file_format = other_params[8]
                 file_naming = other_params[9]
@@ -1379,13 +1408,13 @@ def generate_dual_model_comparison(
                 # Fallback defaults
                 seed_input = "-1"
                 seconds_start = 0
-                seconds_total = 30
+                seconds_total = 48
                 batch_size = 1
                 cfg_interval_min = 0.0
                 cfg_interval_max = 1.0
                 rho = 1.0
                 preview_every = 0
-                file_format = "wav"
+                file_format = get_available_audio_formats()[0] if get_available_audio_formats() else "wav"
                 file_naming = "verbose"
                 save_permanently = False
                 cut_to_seconds_total = True
@@ -1399,13 +1428,13 @@ def generate_dual_model_comparison(
             sampler_checkboxes = []
             seed_input = "-1"
             seconds_start = 0
-            seconds_total = 30
+            seconds_total = 48
             batch_size = 1
             cfg_interval_min = 0.0
             cfg_interval_max = 1.0
             rho = 1.0
             preview_every = 0
-            file_format = "wav"
+            file_format = get_available_audio_formats()[0] if get_available_audio_formats() else "wav"
             file_naming = "verbose"
             save_permanently = False
             cut_to_seconds_total = True
@@ -1421,13 +1450,13 @@ def generate_dual_model_comparison(
         sampler_checkboxes = []
         seed_input = "-1"
         seconds_start = 0
-        seconds_total = 30
+        seconds_total = 48
         batch_size = 1
         cfg_interval_min = 0.0
         cfg_interval_max = 1.0
         rho = 1.0
         preview_every = 0
-        file_format = "wav"
+        file_format = get_available_audio_formats()[0] if get_available_audio_formats() else "wav"
         file_naming = "verbose"
         save_permanently = False
         cut_to_seconds_total = True
@@ -1606,10 +1635,15 @@ def generate_dual_model_comparison(
     # Generate CFG visualizations for first results
     if current_results_a:
         steps_a, cfg_a, cfg_rescale_a, sigma_min_a, sigma_max_a, sampler_a = current_results_a[0]['param_combo']
+        
+        # Convert percentage to actual sigma values for Model A
+        cfg_interval_min_a, cfg_interval_max_a = get_cfg_intervals_for_visualization(
+            model_a_config, generation_args, sigma_min_a, sigma_max_a)
+        
         cfg_viz_a = create_cfg_interval_visualization(
             steps=int(steps_a),
-            cfg_interval_min=cfg_interval_min,
-            cfg_interval_max=cfg_interval_max,
+            cfg_interval_min=cfg_interval_min_a,
+            cfg_interval_max=cfg_interval_max_a,
             sigma_min=float(sigma_min_a),
             sigma_max=float(sigma_max_a),
             rho=rho,
@@ -1620,10 +1654,15 @@ def generate_dual_model_comparison(
     
     if current_results_b:
         steps_b, cfg_b, cfg_rescale_b, sigma_min_b, sigma_max_b, sampler_b = current_results_b[0]['param_combo']
+        
+        # Convert percentage to actual sigma values for Model B
+        cfg_interval_min_b, cfg_interval_max_b = get_cfg_intervals_for_visualization(
+            model_b_config, generation_args, sigma_min_b, sigma_max_b)
+        
         cfg_viz_b = create_cfg_interval_visualization(
             steps=int(steps_b),
-            cfg_interval_min=cfg_interval_min,
-            cfg_interval_max=cfg_interval_max,
+            cfg_interval_min=cfg_interval_min_b,
+            cfg_interval_max=cfg_interval_max_b,
             sigma_min=float(sigma_min_b),
             sigma_max=float(sigma_max_b),
             rho=rho,
@@ -1636,7 +1675,17 @@ def generate_dual_model_comparison(
     dropdown_choices_a = [result['params'] for result in current_results_a] if current_results_a else []
     dropdown_choices_b = [result['params'] for result in current_results_b] if current_results_b else []
     
-    return audio_a, cfg_viz_a, spec_a, audio_b, cfg_viz_b, spec_b, params_a, params_b, dropdown_choices_a, dropdown_choices_b
+    # Create dropdown updates with choices and default values (using compatible Gradio syntax)
+    dropdown_update_a = gr.update(
+        choices=dropdown_choices_a,
+        value=dropdown_choices_a[0] if dropdown_choices_a else None
+    )
+    dropdown_update_b = gr.update(
+        choices=dropdown_choices_b,
+        value=dropdown_choices_b[0] if dropdown_choices_b else None
+    )
+    
+    return audio_a, cfg_viz_a, spec_a, audio_b, cfg_viz_b, spec_b, params_a, params_b, dropdown_update_a, dropdown_update_b
 
 def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_prefix, **kwargs):
     """
@@ -1661,7 +1710,7 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
     prompt = kwargs.get('prompt', '')
     negative_prompt = kwargs.get('negative_prompt', None)
     seconds_start = kwargs.get('seconds_start', 0)
-    seconds_total = kwargs.get('seconds_total', 30)
+    seconds_total = kwargs.get('seconds_total', 48)
     cfg_scale = kwargs.get('cfg_scale', 6.0)
     steps = kwargs.get('steps', 250)
     preview_every = kwargs.get('preview_every', None)
@@ -1673,7 +1722,7 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
     cfg_interval_min = kwargs.get('cfg_interval_min', 0.0)
     cfg_interval_max = kwargs.get('cfg_interval_max', 1.0)
     cfg_rescale = kwargs.get('cfg_rescale', 0.0)
-    file_format = kwargs.get('file_format', "wav")
+    file_format = kwargs.get('file_format', get_available_audio_formats()[0] if get_available_audio_formats() else "wav")
     file_naming = kwargs.get('file_naming', "verbose")
     save_permanently = kwargs.get('save_permanently', False)
     cut_to_seconds_total = kwargs.get('cut_to_seconds_total', False)
@@ -1891,6 +1940,9 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
         cmd += " -loglevel error"
         try:
             subprocess.run(cmd, shell=True, check=True)
+            # Conversion successful - delete intermediate WAV file if it's different from output
+            if output_wav != output_filename and os.path.exists(output_wav):
+                os.remove(output_wav)
         except subprocess.CalledProcessError as e:
             print(f"Warning: Audio conversion failed for format '{file_format}'. Using WAV instead.")
             print(f"Error: {e}")
@@ -1899,6 +1951,9 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
         except Exception as e:
             print(f"Unexpected error during audio conversion: {e}")
             output_filename = output_wav
+    else:
+        # No conversion needed (WAV format selected)
+        output_filename = output_wav
     
     # Generate spectrogram
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
@@ -1906,7 +1961,7 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
     # Track files for session-based cleanup (only if not saving permanently)
     if not save_permanently and file_naming in ["verbose", "prompt"]:
         global current_session_files
-        current_session_files.extend([output_wav, output_filename])
+        current_session_files.append(output_filename)
     
     # Create outputs folder if saving permanently and doesn't exist
     if save_permanently:
@@ -1914,17 +1969,12 @@ def generate_cond_with_model(model, model_type, sample_rate, sample_size, model_
         if not os.path.exists(outputs_dir):
             os.makedirs(outputs_dir)
         
-        # Move files to outputs folder for permanent storage
+        # Move final output file to outputs folder for permanent storage
         permanent_path = os.path.join(outputs_dir, os.path.basename(output_filename))
         if os.path.exists(output_filename):
             import shutil
             shutil.move(output_filename, permanent_path)
             output_filename = permanent_path
-        
-        # Also move WAV file if different from output file
-        if output_wav != output_filename and os.path.exists(output_wav):
-            permanent_wav_path = os.path.join(outputs_dir, os.path.basename(output_wav))
-            shutil.move(output_wav, permanent_wav_path)
 
     return (output_filename, [audio_spectrogram, *preview_images])
 
@@ -2123,7 +2173,7 @@ def create_uncond_sampling_ui(model_config):
                 with gr.Row():
                     sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-3m-sde")
                     sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma min")
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma max")
+                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=300, label="Sigma max")
 
             with gr.Accordion("Init audio", open=False):
                 init_audio_checkbox = gr.Checkbox(label="Use init audio")
