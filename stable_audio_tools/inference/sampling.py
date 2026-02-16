@@ -30,6 +30,7 @@ class DistributionShift:
         self.use_sine = use_sine
 
     def time_shift(self, t: torch.Tensor, seq_len: int):
+        seq_len = min(max(seq_len,self.min_length), self.max_length)
         sigma = 1.0
         mu = - (self.base_shift + (self.max_shift - self.base_shift) * (seq_len - self.min_length) / (self.max_length - self.min_length))
         t_out = 1 - math.exp(mu) / (math.exp(mu) + (1 / (1 - t) - 1) ** sigma)
@@ -384,6 +385,8 @@ def sample_k(
             return K.sampling.sample_dpmpp_2m_sde(denoiser, x, sigmas, disable=False, callback=callback, extra_args=extra_args)
         elif sampler_type == "dpmpp-3m-sde":
             return K.sampling.sample_dpmpp_3m_sde(denoiser, x, sigmas, disable=False, callback=callback, extra_args=extra_args)
+        else:
+            raise ValueError(f"Unknown sampler_type: {sampler_type}")
     elif is_v_diff:
 
         if sigma_max > 1: # sigma_max should be between 0 and 1
@@ -455,3 +458,5 @@ def sample_rf(
         return sample_flow_dpmpp(model_fn, x, sigmas=t, sigma_max=sigma_max, callback=callback, **extra_args)
     elif sampler_type == "pingpong":
         return sample_flow_pingpong(model_fn, x, sigmas=t, sigma_max=sigma_max, callback=callback, **extra_args)
+    else:
+        raise ValueError(f"Unknown sampler_type: {sampler_type}")
