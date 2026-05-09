@@ -459,3 +459,161 @@ def sample_rf(
         return sample_flow_pingpong(model_fn, x, sigmas=t, sigma_max=sigma_max, callback=callback, **extra_args)
     else:
         raise ValueError(f"Unknown sampler_type: {sampler_type}")
+
+@torch.enable_grad()
+def sample_euler_latch_guided(
+    model_fn,
+    x,
+    latch_guides,
+    steps=None,
+    sigma_max=1.0,
+    sigmas=None,
+    dist_shift=None,
+    callback=None,
+    device="cuda",
+    rho=0.03,
+    mu=0.03,
+    gamma=0.3,
+    n_iter=4,
+    disable_tqdm=False,
+    diff_objective="v",
+    log_norms=False,
+    **extra_args
+):
+    """
+    Euler sampler with multi-guide LatCH generation (Selective TFG).
+
+    Args:
+        latch_guides: list of dicts, each with keys:
+            model      – loaded LatCH nn.Module
+            target     – target feature tensor [B, C_out, T]
+            weight     – gradient multiplier
+            start_pct  – fraction of steps where guidance begins (0 = first step)
+            end_pct    – fraction of steps where guidance ends
+    """
+    assert steps is not None or sigmas is not None
+    device = x.device
+    b = x.shape[0]
+    ts = x.new_ones([b])
+    is_rf = diff_objective in ("rectified_flow", "rf_denoiser")
+
+    # ── time / noise schedule ──────────────────────────────────────────
+    if is_rf:
+        _sm = min(sigma_max, 1.0)
+        if sigmas is None:
+            lsnr_max = math.log(((1 - _sm) / _sm) + 1e-6) if _sm < 1 else -6
+            t = torch.sigmoid(-torch.linspace(lsnr_max, 2, steps + 1))
+            t[0], t[-1] = _sm, 0
+        else:
+            t = sigmas
+        alphas_arr, sigmas_arr = 1.0 - t, t
+    else:
+        if sigmas is None:
+            t = torch.linspace(sigma_max, 0, steps + 1)
+            if dist_shift is not None:
+                t = dist_shift.time_shift(t, x.shape[-1])
+        else:
+            t = sigmas
+        alphas_arr, sigmas_arr = get_alphas_sigmas(t)
+
+    num_steps = len(t) - 1
+    sum_alphas = alphas_arr.sum()
+    criterion = torch.nn.MSELoss()
+    log_rows = [] if log_norms else None
+
+    # pre-compute per-guide step ranges
+    for g in latch_guides:
+        g["_start"] = int(num_steps * g["start_pct"])
+        g["_end"]   = int(num_steps * g["end_pct"])
+
+    for i, (t_curr, t_prev) in enumerate(
+        tqdm(zip(t[:-1], t[1:]), disable=disable_tqdm, total=num_steps)
+    ):
+        t_curr_tensor = t_curr * ts
+        if is_rf:
+            sigma, sigma_next, alpha = t_curr.item(), t_prev.item(), 1.0 - t_curr.item()
+        else:
+            sigma = sigmas_arr[i].item()
+            sigma_next = sigmas_arr[i+1].item() if i+1 < len(sigmas_arr) else 0.0
+            alpha = alphas_arr[i].item()
+
+        s_t   = alpha / sum_alphas
+        rho_t = rho * s_t
+        mu_t  = mu  * s_t
+
+        active = [g for g in latch_guides if g["_start"] <= i < g["_end"]]
+        if active:
+            x = x.detach().requires_grad_(True)
+
+        with torch.no_grad():
+            v_pred = model_fn(x, t_curr_tensor, **extra_args)
+
+        z_0_t = (x - t_curr * v_pred) if is_rf else (alpha * x - sigma * v_pred)
+
+        grad_var = 0.0
+        if active:
+            t_norm = (num_steps - i) / num_steps
+            t_ten  = torch.full((b,), t_norm, device=device)  # fp32 for LatCH
+
+            # variance guidance — weighted sum of losses, single autograd call
+            # LatCH is fp32; cast x to fp32 for the forward pass (grads flow back through cast)
+            total_loss_var = sum(
+                g["weight"] * criterion(g["model"](x.float(), t_ten), g["target"])
+                for g in active
+            )
+            grad_var = torch.autograd.grad(total_loss_var, x)[0]
+
+            if log_rows is not None:
+                gv_norm = grad_var.detach().norm().item()
+                x_norm  = x.detach().norm().item()
+                log_rows.append({
+                    "i": i, "sigma": float(sigma), "x_norm": x_norm,
+                    "gv_norm": gv_norm, "rho_t": float(rho_t),
+                    "var_perturb_rel": float(rho_t) * gv_norm / (x_norm + 1e-12),
+                    "gm_norms": [],
+                })
+
+            # mean guidance iterations on z₀|t
+            t_zero = torch.zeros((b,), device=device)  # fp32 for LatCH
+            for _ in range(n_iter):
+                z_0_t = z_0_t.detach().requires_grad_(True)
+                total_loss_mean = sum(
+                    g["weight"] * criterion(
+                        g["model"](z_0_t.float(), t_zero)
+                        + torch.randn(g["target"].shape, device=device) * (gamma * s_t),
+                        g["target"],
+                    )
+                    for g in active
+                )
+                grad_mean = torch.autograd.grad(total_loss_mean, z_0_t)[0]
+                if log_rows is not None:
+                    log_rows[-1]["gm_norms"].append(grad_mean.detach().norm().item())
+                z_0_t = z_0_t - mu_t * grad_mean
+
+        # euler step
+        if is_rf:
+            d = (x - z_0_t) / t_curr if t_curr > 0 else torch.zeros_like(x)
+            x_next = x + d * (t_prev - t_curr)
+        else:
+            d = (x - z_0_t) / sigma if sigma > 0 else torch.zeros_like(x)
+            x_next = x + d * (sigma_next - sigma)
+
+        if active:
+            x_next = x_next - rho_t * grad_var
+        x = x_next.detach()
+
+        if callback is not None:
+            callback({'x': x, 't': t_curr, 'sigma': sigma,
+                      'i': i + 1, 'denoised': z_0_t.detach()})
+
+    if log_rows is not None and log_rows:
+        print("\n[LatCH] Per-step guidance gradient norms:")
+        print(f"{'i':>4} {'sigma':>8} {'||x||':>10} {'||grad_var||':>12} "
+              f"{'rho_t·rel_var':>14} {'||grad_mean||':>14} {'iters':>6}")
+        for row in log_rows:
+            gm_mean = sum(row["gm_norms"]) / max(1, len(row["gm_norms"]))
+            print(f"{row['i']:>4} {row['sigma']:>8.4f} {row['x_norm']:>10.4f} "
+                  f"{row['gv_norm']:>12.4e} {row['var_perturb_rel']:>14.4e} "
+                  f"{gm_mean:>14.4e} {len(row['gm_norms']):>6}")
+        print(f"[LatCH] Total guided steps logged: {len(log_rows)}\n")
+    return x
