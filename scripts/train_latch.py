@@ -34,7 +34,7 @@ def _sample_target_stats(dataset, n: int = 200):
     """
     import random
     import numpy as np
-    idxs = list(range(min(n, len(dataset))))
+    idxs = list(range(len(dataset)))
     random.shuffle(idxs)
     samples = []
     for i in idxs[:n]:
