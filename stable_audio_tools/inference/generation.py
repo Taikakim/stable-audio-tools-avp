@@ -206,8 +206,9 @@ def generate_diffusion_cond(
         from ..models.latch import load_latch_from_checkpoint
         from .latch_targets import build_target
 
-        latent_fps = float(model.sample_rate) / float(model.pretransform.downsampling_ratio) \
-            if model.pretransform is not None else 21.5
+        if model.pretransform is None:
+            raise ValueError("LatCH guidance requires a latent pretransform")
+        latent_fps = float(model.sample_rate) / float(model.pretransform.downsampling_ratio)
 
         latch_guides = []
         for cfg in latch_configs:
@@ -236,7 +237,8 @@ def generate_diffusion_cond(
         callback_fn = sampler_kwargs.get("callback", None)
         model_extra = {k: v for k, v in sampler_kwargs.items()
                        if k not in ("sampler_type", "sigma_min",
-                                    "sigma_max", "rho", "callback")}
+                                    "sigma_max", "rho", "mu", "gamma",
+                                    "n_iter", "log_norms", "callback")}
 
         print(f"[LatCH] {len(latch_guides)} guide(s), objective={diff_objective}, "
               f"latent_fps={latent_fps:.2f}")
