@@ -6,7 +6,7 @@ from torchaudio import transforms as T
 from torch.nn.functional import interpolate
 
 from .utils import prepare_audio
-from .sampling import sample, sample_k, sample_rf
+from .sampling import sample, sample_k, sample_rf, sample_euler_latch_guided
 from ..data.utils import PadCrop
 
 def generate_diffusion_uncond(
@@ -104,15 +104,17 @@ def generate_diffusion_cond(
         init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         init_noise_level: float = 1.0,
         return_latents = False,
+        latch_configs: list = None,
+        latch_hparams: dict = None,
         **sampler_kwargs
-        ) -> torch.Tensor: 
+        ) -> torch.Tensor:
     """
     Generate audio from a prompt using a diffusion model.
-    
+
     Args:
         model: The diffusion model to use for generation.
         steps: The number of diffusion steps to use.
-        cfg_scale: Classifier-free guidance scale 
+        cfg_scale: Classifier-free guidance scale
         conditioning: A dictionary of conditioning parameters to use for generation.
         conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
         batch_size: The batch size to use for generation.
@@ -123,7 +125,16 @@ def generate_diffusion_cond(
         init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
         init_noise_level: The noise level to use when generating from an initial audio sample.
         return_latents: Whether to return the latents used for generation instead of the decoded audio.
-        **sampler_kwargs: Additional keyword arguments to pass to the sampler.    
+        latch_configs: Optional list of dicts with keys:
+            model_path (str): path to .pt
+            kind (str, optional): one of 'constant'|'ramp_up'|'ramp_down'|'beat_grid';
+                                  defaults to checkpoint metadata target_kind_default,
+                                  or 'constant' if absent.
+            value (float): target value (scalar/ramp peak/BPM depending on kind).
+            weight, start_pct, end_pct (float): TFG per-guide weighting.
+        latch_hparams: Optional dict with keys rho, mu, gamma, n_iter, log_norms
+            (forwarded to sample_euler_latch_guided). All optional.
+        **sampler_kwargs: Additional keyword arguments to pass to the sampler.
     """
 
     # The length of the output in audio samples 
@@ -190,7 +201,64 @@ def generate_diffusion_cond(
 
     diff_objective = model.diffusion_objective
 
-    if diff_objective == "v":    
+    if latch_configs:
+        # ── LatCH-guided generation ───────────────────────────────────
+        from ..models.latch import load_latch_from_checkpoint
+        from .latch_targets import build_target
+
+        latent_fps = float(model.sample_rate) / float(model.pretransform.downsampling_ratio) \
+            if model.pretransform is not None else 21.5
+
+        latch_guides = []
+        for cfg in latch_configs:
+            print(f"[LatCH] Loading {cfg['model_path']}")
+            latch = load_latch_from_checkpoint(cfg["model_path"], device=str(device))
+            kind = cfg.get("kind") or latch.metadata.get("target_kind_default", "constant")
+            value = float(cfg.get("value", cfg.get("target_scale", 1.0)))
+            target = build_target(
+                kind, value,
+                batch_size=batch_size,
+                channels=latch.out_channels,
+                frames=sample_size,
+                fps=latent_fps,
+                device=device,
+                dtype=torch.float32,
+            )
+            print(f"[LatCH]   kind={kind}  value={value}  target.shape={tuple(target.shape)}  "
+                  f"target.range=[{target.min().item():.4f}, {target.max().item():.4f}]")
+            latch_guides.append({
+                "model": latch, "target": target,
+                "weight": cfg["weight"],
+                "start_pct": cfg["start_pct"], "end_pct": cfg["end_pct"],
+            })
+
+        sigma_max_val = sampler_kwargs.get("sigma_max", 1.0)
+        callback_fn = sampler_kwargs.get("callback", None)
+        model_extra = {k: v for k, v in sampler_kwargs.items()
+                       if k not in ("sampler_type", "sigma_min",
+                                    "sigma_max", "rho", "callback")}
+
+        print(f"[LatCH] {len(latch_guides)} guide(s), objective={diff_objective}, "
+              f"latent_fps={latent_fps:.2f}")
+
+        sampled = sample_euler_latch_guided(
+            model.model, noise, latch_guides,
+            steps=steps, sigma_max=sigma_max_val,
+            diff_objective=diff_objective,
+            dist_shift=getattr(model, 'dist_shift', None),
+            callback=callback_fn, device=device,
+            **(latch_hparams or {}),
+            **model_extra, **conditioning_inputs,
+            **negative_conditioning_tensors,
+            cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True,
+        )
+
+        for g in latch_guides:
+            del g["model"], g["target"]
+        del latch_guides
+        torch.cuda.empty_cache()
+
+    elif diff_objective == "v":    
         # k-diffusion denoising process go!
         sampled = sample_k(model.model, noise, init_audio, steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device)
     elif diff_objective in ["rectified_flow", "rf_denoiser"]:
