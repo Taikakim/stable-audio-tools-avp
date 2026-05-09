@@ -20,18 +20,19 @@ from ...inference.generation import generate_diffusion_cond, generate_diffusion_
 
 
 def _read_latch_metadata(latch_dir, model_name: str) -> dict:
-    """Best-effort metadata read for a LatCH .pt file. Returns {} on any failure."""
+    """Best-effort metadata read for a LatCH .pt file. Returns {} on any failure.
+    Strips ``state_dict`` from the returned payload to avoid keeping ~20 MB of
+    weight tensors alive on every UI dropdown change."""
     if not model_name or model_name == "none":
         return {}
     try:
         import torch
-        from pathlib import Path
         path = latch_dir / model_name
         if not path.exists():
             return {}
         raw = torch.load(path, map_location="cpu", weights_only=True)
         if isinstance(raw, dict) and "feature_stats" in raw:
-            return raw
+            return {k: v for k, v in raw.items() if k != "state_dict"}
     except Exception:
         pass
     return {}
