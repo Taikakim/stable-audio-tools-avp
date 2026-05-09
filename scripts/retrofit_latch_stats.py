@@ -14,6 +14,7 @@ Each .pt file in --dir is inspected:
 Requires that /run/media/kim/{Lehto,Mantu} drives are mounted (LatCHDataset needs them).
 """
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -58,6 +59,9 @@ def retrofit_one(path: Path, latent_dir: str, info_dir: str, dry_run: bool) -> b
         return False
 
     stats = _sample_target_stats(dataset, n=200)
+    if not stats:
+        print(f"    -> stats sampling returned empty (drives stale?); skipping")
+        return False
     kind = _default_kind_for(bare)
     print(f"    stats={stats}  kind={kind}")
 
@@ -71,7 +75,9 @@ def retrofit_one(path: Path, latent_dir: str, info_dir: str, dry_run: bool) -> b
         "feature_stats": stats,
         "target_kind_default": kind,
     }
-    torch.save(payload, path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
     return True
 
 
