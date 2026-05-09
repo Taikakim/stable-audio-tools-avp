@@ -18,6 +18,25 @@ from PIL import Image
 from ..aeiou import audio_spectrogram_image
 from ...inference.generation import generate_diffusion_cond, generate_diffusion_cond_inpaint
 
+
+def _read_latch_metadata(latch_dir, model_name: str) -> dict:
+    """Best-effort metadata read for a LatCH .pt file. Returns {} on any failure."""
+    if not model_name or model_name == "none":
+        return {}
+    try:
+        import torch
+        from pathlib import Path
+        path = latch_dir / model_name
+        if not path.exists():
+            return {}
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(raw, dict) and "feature_stats" in raw:
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
 model = None
 model_type = None
 sample_size = 2097152
@@ -689,6 +708,50 @@ def create_sampling_ui(model_config):
                                                      value=0.0, label="Start %")
                     latch_end_2_slider   = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
                                                      value=0.20, label="End %")
+
+                def _on_latch_model_change(model_name, kind):
+                    md = _read_latch_metadata(latch_dir, model_name)
+                    stats = md.get("feature_stats", {}) if md else {}
+                    default_kind = md.get("target_kind_default", "constant") if md else "constant"
+                    if kind == "beat_grid":
+                        slider_min, slider_max, slider_step, slider_val = 30.0, 240.0, 1.0, 120.0
+                    elif stats and "min" in stats and "max" in stats:
+                        slider_min = float(stats["min"])
+                        slider_max = float(stats["max"]) * 2.0 if stats["max"] > 0 else 1.0
+                        slider_step = max((slider_max - slider_min) / 100.0, 1e-4)
+                        slider_val = float(stats.get("mean", (slider_min + slider_max) / 2.0))
+                    else:
+                        slider_min, slider_max, slider_step, slider_val = 0.0, 5.0, 0.05, 1.0
+                    return (
+                        gr.update(minimum=slider_min, maximum=slider_max,
+                                  step=slider_step, value=slider_val),
+                        gr.update(value=default_kind if model_name != "none" else kind),
+                    )
+
+                latch_model_1_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider, latch_kind_1_dropdown],
+                )
+                latch_model_2_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider, latch_kind_2_dropdown],
+                )
+
+                def _on_latch_kind_change(model_name, kind):
+                    return _on_latch_model_change(model_name, kind)[0]
+
+                latch_kind_1_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider],
+                )
+                latch_kind_2_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider],
+                )
 
             inputs = [
                 prompt, 
