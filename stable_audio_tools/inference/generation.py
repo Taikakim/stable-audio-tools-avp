@@ -214,6 +214,12 @@ def generate_diffusion_cond(
         for cfg in latch_configs:
             print(f"[LatCH] Loading {cfg['model_path']}")
             latch = load_latch_from_checkpoint(cfg["model_path"], device=str(device))
+            head_sched = latch.metadata.get("noise_schedule")
+            if head_sched is not None and head_sched != diff_objective:
+                print(f"[LatCH]   WARNING: head was trained for noise_schedule="
+                      f"'{head_sched}' but model objective is '{diff_objective}'. "
+                      f"Guidance gradients will be unreliable — retrain the head "
+                      f"with --objective {diff_objective}.")
             kind = cfg.get("kind") or latch.metadata.get("target_kind_default", "constant")
             value = float(cfg.get("value", cfg.get("target_scale", 1.0)))
             target = build_target(
@@ -231,6 +237,7 @@ def generate_diffusion_cond(
                 "model": latch, "target": target,
                 "weight": cfg["weight"],
                 "start_pct": cfg["start_pct"], "end_pct": cfg["end_pct"],
+                "loss_type": latch.metadata.get("loss_type", "mse"),
             })
 
         sigma_max_val = sampler_kwargs.get("sigma_max", 1.0)

@@ -1,4 +1,16 @@
 import os
+
+# Apply the ROCm "training" profile from rocm_env.yaml BEFORE importing torch.
+# Loaded standalone via importlib so the stable_audio_tools package __init__
+# (which imports torch) does NOT run first — values live only in rocm_env.yaml.
+import importlib.util as _ilu
+from pathlib import Path as _Path
+_re_path = _Path(__file__).resolve().parent.parent / "stable_audio_tools" / "rocm_env.py"
+_spec = _ilu.spec_from_file_location("_sat_rocm_env", _re_path)
+_rocm_env = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_rocm_env)
+_rocm_env.apply_profile("training")
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,15 +28,24 @@ from latch_model import LatCH
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def vp_noise_schedule(t):
+def forward_noise_schedule(t, objective):
+    """Forward (LatCH-F) noising schedule for timestep t in [0, 1].
+
+    MUST match the diffusion model the head will guide, otherwise the head is
+    queried on out-of-distribution latents at sampling time. t=0 is clean,
+    t=1 is pure noise in both conventions. Returns (alpha_t, sigma_t).
+
+      rectified_flow / rf_denoiser :  z_t = (1-t)·z0 + t·noise   (linear)
+      v                            :  z_t = cos(π/2 t)·z0 + sin(π/2 t)·noise  (VP)
     """
-    Standard Variance-Preserving noise schedule.
-    t: [B] in [0, 1]
-    returns alpha_t, sigma_t
-    """
-    # alpha_t = cos(pi/2 * t), sigma_t = sin(pi/2 * t)
-    alpha_t = torch.cos(math.pi / 2 * t)
-    sigma_t = torch.sin(math.pi / 2 * t)
+    if objective in ("rectified_flow", "rf_denoiser"):
+        alpha_t = 1.0 - t
+        sigma_t = t
+    elif objective == "v":
+        alpha_t = torch.cos(math.pi / 2 * t)
+        sigma_t = torch.sin(math.pi / 2 * t)
+    else:
+        raise ValueError(f"Unknown diffusion objective: {objective!r}")
     return alpha_t, sigma_t
 
 def _sample_target_stats(dataset, n: int = 200):
@@ -73,8 +94,11 @@ def train(
     lr=1e-4,
     save_dir="latch_weights",
     db_path=None,
+    objective="rectified_flow",
 ):
     os.makedirs(save_dir, exist_ok=True)
+    print(f"Forward-noising schedule: objective={objective} "
+          f"(MUST match the diffusion model this head will guide)")
 
     # Init Dataset
     dataset = LatCHDataset(
@@ -114,6 +138,7 @@ def train(
             t_norm = targets / (targets.norm(dim=1, keepdim=True) + 1e-8)
             return (1.0 - (p_norm * t_norm).sum(dim=1)).mean()
         criterion = cosine_loss
+        loss_type = "cosine"
     elif "beat" in bare or "onset" in bare:
         def sparse_weighted_bce(preds, targets, threshold=0.2):
             loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
@@ -122,8 +147,10 @@ def train(
             loss_inactive = loss[~mask].mean() if (~mask).sum() > 0 else preds.new_tensor(0.0)
             return (loss_active + loss_inactive) / 2
         criterion = sparse_weighted_bce
+        loss_type = "bce_logits"  # head emits logits; inference guidance must match
     else:
         criterion = nn.MSELoss()
+        loss_type = "mse"
         
     print(f"Starting training on feature: {target_feature} with {len(dataset)} items.")
     
@@ -143,8 +170,8 @@ def train(
             # Sample timesteps
             t = torch.rand((B,), device=device) # t in [0, 1]
             
-            # Forward simulated noise (LatCH-F)
-            alpha_t, sigma_t = vp_noise_schedule(t)
+            # Forward simulated noise (LatCH-F) — schedule must match the model
+            alpha_t, sigma_t = forward_noise_schedule(t, objective)
             alpha_t = alpha_t.view(B, 1, 1)
             sigma_t = sigma_t.view(B, 1, 1)
             
@@ -173,6 +200,8 @@ def train(
             "feature_name": target_feature,
             "feature_stats": feature_stats,
             "target_kind_default": target_kind_default,
+            "noise_schedule": objective,  # forward-noising convention the head expects
+            "loss_type": loss_type,       # mse | bce_logits | cosine
         }
         torch.save(checkpoint, os.path.join(save_dir, f"latch_{target_feature}_ep{epoch+1}.pt"))
 
@@ -198,6 +227,12 @@ if __name__ == "__main__":
         help="Override path to timeseries.db (default: /home/kim/Projects/mir/data/timeseries.db)"
     )
     parser.add_argument("--save-dir", type=str, default="latch_weights")
+    parser.add_argument(
+        "--objective", type=str, default="rectified_flow",
+        choices=["rectified_flow", "rf_denoiser", "v"],
+        help=("Forward-noising schedule; MUST match the diffusion model this head "
+              "will guide. Small base model = rectified_flow.")
+    )
     args = parser.parse_args()
 
     train(
@@ -208,4 +243,5 @@ if __name__ == "__main__":
         lr=args.lr,
         db_path=args.db_path,
         save_dir=args.save_dir,
+        objective=args.objective,
     )

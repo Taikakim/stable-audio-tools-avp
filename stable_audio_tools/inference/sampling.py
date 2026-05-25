@@ -460,6 +460,25 @@ def sample_rf(
     else:
         raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
+def _make_latch_criterion(loss_type):
+    """Guidance loss matching how the head was trained (see train_latch.py).
+
+    bce_logits : head emits logits (beat/onset) — score with BCEWithLogits so the
+                 gradient matches training; MSE on logits points the wrong way.
+    cosine     : hpcp/chroma direction similarity.
+    mse        : everything else (rms, spectral_*, tonic, …).
+    """
+    if loss_type == "bce_logits":
+        return torch.nn.BCEWithLogitsLoss()
+    if loss_type == "cosine":
+        def _cos(pred, target):
+            p = pred / (pred.norm(dim=1, keepdim=True) + 1e-8)
+            t = target / (target.norm(dim=1, keepdim=True) + 1e-8)
+            return (1.0 - (p * t).sum(dim=1)).mean()
+        return _cos
+    return torch.nn.MSELoss()
+
+
 @torch.enable_grad()
 def sample_euler_latch_guided(
     model_fn,
@@ -518,13 +537,13 @@ def sample_euler_latch_guided(
 
     num_steps = len(t) - 1
     sum_alphas = alphas_arr.sum()
-    criterion = torch.nn.MSELoss()
     log_rows = [] if log_norms else None
 
-    # pre-compute per-guide step ranges
+    # pre-compute per-guide step ranges and the training-matched loss
     for g in latch_guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"]   = int(num_steps * g["end_pct"])
+        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"))
 
     for i, (t_curr, t_prev) in enumerate(
         tqdm(zip(t[:-1], t[1:]), disable=disable_tqdm, total=num_steps)
@@ -552,13 +571,17 @@ def sample_euler_latch_guided(
 
         grad_var = 0.0
         if active:
-            t_norm = (num_steps - i) / num_steps
-            t_ten  = torch.full((b,), t_norm, device=device)  # fp32 for LatCH
+            # The head was trained with t = the schedule time of the noised latent
+            # (t=0 clean, t=1 noise). x at this step sits at t_curr, so query the
+            # head at t_curr — NOT a linear step fraction, which is grossly wrong
+            # for nonlinear schedules (e.g. RF sigmoid: step 10/50 -> t_curr~0.99,
+            # not 0.8). Mean guidance below uses t=0 because z_0|t is the clean est.
+            t_ten = torch.full((b,), float(t_curr), device=device)  # fp32 for LatCH
 
             # variance guidance — weighted sum of losses, single autograd call
             # LatCH is fp32; cast x to fp32 for the forward pass (grads flow back through cast)
             total_loss_var = sum(
-                g["weight"] * criterion(g["model"](x.float(), t_ten), g["target"])
+                g["weight"] * g["_criterion"](g["model"](x.float(), t_ten), g["target"])
                 for g in active
             )
             grad_var = torch.autograd.grad(total_loss_var, x)[0]
@@ -577,12 +600,15 @@ def sample_euler_latch_guided(
             t_zero = torch.zeros((b,), device=device)  # fp32 for LatCH
             for _ in range(n_iter):
                 z_0_t = z_0_t.detach().requires_grad_(True)
+                # γ noise augmentation: perturb the INPUT estimate (TFG-style) so
+                # the guidance gradient is smoothed over a neighbourhood of z₀|t.
+                # (Previously noise was added to the head's OUTPUT, which only
+                # injected gradient noise and, scaled by s_t, vanished.)
+                z_in = z_0_t.float()
+                if gamma > 0:
+                    z_in = z_in + torch.randn_like(z_in) * gamma
                 total_loss_mean = sum(
-                    g["weight"] * criterion(
-                        g["model"](z_0_t.float(), t_zero)
-                        + torch.randn(g["target"].shape, device=device) * (gamma * s_t),
-                        g["target"],
-                    )
+                    g["weight"] * g["_criterion"](g["model"](z_in, t_zero), g["target"])
                     for g in active
                 )
                 grad_mean = torch.autograd.grad(total_loss_mean, z_0_t)[0]

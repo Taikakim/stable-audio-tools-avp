@@ -60,7 +60,7 @@ Legacy bare-state-dict files are still loadable (with empty `metadata`), but the
 inference UI cannot auto-range their target sliders. Retrofit them once with:
 
 ```bash
-source rocm_env.sh && python scripts/retrofit_latch_stats.py
+python scripts/retrofit_latch_stats.py
 ```
 
 This rewrites every `latch_weights/*.pt` into the v2 format, computing
