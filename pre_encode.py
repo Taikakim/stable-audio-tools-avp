@@ -3,6 +3,7 @@ import gc
 import json
 from pathlib import Path
 
+import stable_audio_tools.rocm_env  # set HIP/MIOpen/TunableOp env before torch
 import numpy as np
 import pytorch_lightning as pl
 import torch

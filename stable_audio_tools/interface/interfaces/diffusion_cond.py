@@ -11,9 +11,32 @@ import os, time, math
 
 from einops import rearrange
 from torchaudio import transforms as T
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from PIL import Image
 
 from ..aeiou import audio_spectrogram_image
 from ...inference.generation import generate_diffusion_cond, generate_diffusion_cond_inpaint
+
+
+def _read_latch_metadata(latch_dir, model_name: str) -> dict:
+    """Best-effort metadata read for a LatCH .pt file. Returns {} on any failure.
+    Strips ``state_dict`` from the returned payload to avoid keeping ~20 MB of
+    weight tensors alive on every UI dropdown change."""
+    if not model_name or model_name == "none":
+        return {}
+    try:
+        import torch
+        path = latch_dir / model_name
+        if not path.exists():
+            return {}
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(raw, dict) and "feature_stats" in raw:
+            return {k: v for k, v in raw.items() if k != "state_dict"}
+    except Exception:
+        pass
+    return {}
+
 
 model = None
 model_type = None
@@ -21,6 +44,145 @@ sample_size = 2097152
 sample_rate = 44100
 model_half = True
 diffusion_objective = None
+preview_images = []
+
+# Global sigma debug settings - these get set before generation and read by dit.py
+sigma_debug_settings = {
+    "print_sigma": False,
+    "chart_sigma": False,
+    "cfg_scale": 1.0,
+    "cfg_rescale": 0.0,
+    "cfg_interval": (0.0, 1.0),
+    "data": []  # Collected during generation: list of (step, sigma, progress, cfg_active)
+}
+
+def reset_sigma_debug_data():
+    """Reset the collected sigma data before a new generation."""
+    sigma_debug_settings["data"] = []
+
+def collect_sigma_data(step, sigma, progress, cfg_active):
+    """Called from dit.py to collect sigma data for charting."""
+    sigma_debug_settings["data"].append({
+        "step": step,
+        "sigma": sigma,
+        "progress": progress,
+        "cfg_active": cfg_active
+    })
+
+def create_sigma_chart(steps, cfg_interval, cfg_scale, cfg_rescale):
+    """
+    Create a chart showing sigma progression and CFG application.
+    
+    Args:
+        steps: Total number of steps
+        cfg_interval: Tuple of (min, max) for CFG interval
+        cfg_scale: The CFG scale value
+        cfg_rescale: The CFG rescale amount
+    
+    Returns:
+        PIL Image of the chart
+    """
+    data = sigma_debug_settings["data"]
+    
+    if not data:
+        # No data collected, return a placeholder
+        fig = Figure(figsize=(5, 4), dpi=100, facecolor='black')
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(facecolor='black')
+        ax.text(0.5, 0.5, 'No sigma data collected', color='white', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        canvas.draw()
+        rgba = np.asarray(canvas.buffer_rgba())
+        return Image.fromarray(rgba)
+    
+    # Extract data
+    step_nums = [d["step"] for d in data]
+    sigmas = [d["sigma"] for d in data]
+    progresses = [d["progress"] for d in data]
+    cfg_actives = [d["cfg_active"] for d in data]
+    
+    # Create figure with dark background
+    fig = Figure(figsize=(5, 4), dpi=100, facecolor='black')
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(facecolor='black')
+    
+    # Style the axes
+    ax.spines['bottom'].set_color('white')
+    ax.spines['top'].set_color('white')
+    ax.spines['left'].set_color('white')
+    ax.spines['right'].set_color('white')
+    ax.tick_params(colors='white', which='both')
+    ax.xaxis.label.set_color('white')
+    ax.yaxis.label.set_color('white')
+    ax.title.set_color('white')
+    
+    # Plot sigma as blue line
+    ax.plot(step_nums, sigmas, color='#4A90D9', linewidth=2, label='Sigma (noise level)')
+    
+    # Plot progress as cyan dashed line
+    ax.plot(step_nums, progresses, color='cyan', linewidth=1, linestyle='--', alpha=0.7, label='Progress (1-sigma)')
+    
+    # Find step indices where CFG interval boundaries are crossed
+    cfg_start_progress = cfg_interval[0]
+    cfg_end_progress = cfg_interval[1]
+    
+    # Find the step where progress first exceeds cfg_start_progress (CFG starts)
+    cfg_start_step = None
+    cfg_end_step = None
+    
+    for i, p in enumerate(progresses):
+        if cfg_start_step is None and p >= cfg_start_progress:
+            cfg_start_step = step_nums[i]
+        if cfg_end_step is None and p > cfg_end_progress:
+            cfg_end_step = step_nums[i]
+    
+    # Draw vertical lines for CFG interval boundaries
+    if cfg_start_step is not None:
+        ax.axvline(x=cfg_start_step, color='#00FF00', linewidth=2, linestyle='-', 
+                   label=f'CFG Start (progress={cfg_start_progress:.2f})')
+    
+    if cfg_end_step is not None:
+        ax.axvline(x=cfg_end_step, color='#FF4444', linewidth=2, linestyle='-',
+                   label=f'CFG End (progress={cfg_end_progress:.2f})')
+    
+    # Draw horizontal dashed line for CFG rescale if non-zero
+    if cfg_rescale > 0:
+        ax.axhline(y=cfg_rescale, color='#FFD700', linewidth=1, linestyle=':',
+                   label=f'CFG Rescale ({cfg_rescale:.2f})')
+    
+    # Shade the region where CFG is active
+    if cfg_start_step is not None or cfg_end_step is not None:
+        start_x = cfg_start_step if cfg_start_step is not None else step_nums[0]
+        end_x = cfg_end_step if cfg_end_step is not None else step_nums[-1]
+        ax.axvspan(start_x, end_x, alpha=0.2, color='#00FF00', label='CFG Active Region')
+    
+    # Set labels and title
+    ax.set_xlabel('Step', fontsize=10)
+    ax.set_ylabel('Value (0-1)', fontsize=10)
+    ax.set_title(f'Sigma & CFG (scale={cfg_scale})', fontsize=11, color='white', pad=10)
+    
+    # Set axis limits
+    ax.set_xlim(0, max(step_nums) if step_nums else steps)
+    ax.set_ylim(0, 1.05)
+    
+    # Add grid
+    ax.grid(True, alpha=0.3, color='gray', linestyle='-', linewidth=0.5)
+    
+    # Create legend with smaller font, positioned below
+    legend = ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), 
+                       ncol=2, fontsize=7, facecolor='black', edgecolor='white',
+                       labelcolor='white')
+    
+    # Adjust layout to make room for legend
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.25)
+    
+    canvas.draw()
+    rgba = np.asarray(canvas.buffer_rgba())
+    return Image.fromarray(rgba)
+
 
 # when using a prompt in a filename
 def condense_prompt(prompt):
@@ -50,6 +212,8 @@ def generate_cond(
         cfg_interval_min=0.0,
         cfg_interval_max=1.0,
         cfg_rescale=0.0,
+        print_sigma=False,
+        chart_sigma=False,
         file_format="wav",
         file_naming="verbose",
         cut_to_seconds_total=False,
@@ -58,7 +222,25 @@ def generate_cond(
         mask_maskstart=None,
         mask_maskend=None,
         inpaint_audio=None,
-        batch_size=1    
+        latch_enable=False,
+        latch_model_1="none",
+        latch_target_1=1.0,
+        latch_weight_1=1.0,
+        latch_start_1=0.0,
+        latch_end_1=0.20,
+        latch_model_2="none",
+        latch_target_2=1.0,
+        latch_weight_2=1.0,
+        latch_start_2=0.0,
+        latch_end_2=0.20,
+        latch_rho=1.0,
+        latch_mu=1.0,
+        latch_gamma=0.3,
+        latch_n_iter=4,
+        latch_log_norms=False,
+        latch_kind_1="constant",
+        latch_kind_2="constant",
+        batch_size=1,
     ):
 
     if torch.cuda.is_available():
@@ -71,6 +253,21 @@ def generate_cond(
     preview_images = []
     if preview_every == 0:
         preview_every = None
+
+    # Set up sigma debug settings BEFORE generation
+    sigma_debug_settings["print_sigma"] = print_sigma
+    sigma_debug_settings["chart_sigma"] = chart_sigma
+    sigma_debug_settings["cfg_scale"] = cfg_scale
+    sigma_debug_settings["cfg_rescale"] = cfg_rescale
+    sigma_debug_settings["cfg_interval"] = (cfg_interval_min, cfg_interval_max)
+    reset_sigma_debug_data()
+    
+    # Reset the step counter in dit.py
+    try:
+        from ...models.dit import reset_step_counter
+        reset_step_counter()
+    except ImportError:
+        pass
 
     # Return fake stereo audio
     conditioning_dict = {"prompt": prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}
@@ -202,6 +399,33 @@ def generate_cond(
         "rho": rho
     }
 
+    if latch_enable:
+        from pathlib import Path
+        latch_dir = Path(__file__).parent.parent.parent.parent / "latch_weights"
+        latch_configs = []
+        for m_name, kind, value, weight, start, end in [
+            (latch_model_1, latch_kind_1, latch_target_1, latch_weight_1, latch_start_1, latch_end_1),
+            (latch_model_2, latch_kind_2, latch_target_2, latch_weight_2, latch_start_2, latch_end_2),
+        ]:
+            if m_name != "none":
+                latch_configs.append({
+                    "model_path": str(latch_dir / m_name),
+                    "kind": kind,
+                    "value": value,
+                    "weight": weight,
+                    "start_pct": start,
+                    "end_pct": end,
+                })
+        if latch_configs:
+            generate_args["latch_configs"] = latch_configs
+            generate_args["latch_hparams"] = {
+                "rho": float(latch_rho),
+                "mu": float(latch_mu),
+                "gamma": float(latch_gamma),
+                "n_iter": int(round(float(latch_n_iter))),
+                "log_norms": bool(latch_log_norms),
+            }
+
      # If inpainting, send mask args
     # This will definitely change in the future
     if model_type == "diffusion_cond":
@@ -225,6 +449,16 @@ def generate_cond(
             })
 
         audio = generate_diffusion_cond_inpaint(**generate_args)
+
+    # Generate sigma chart if requested
+    sigma_chart_image = None
+    if chart_sigma:
+        sigma_chart_image = create_sigma_chart(
+            steps=steps,
+            cfg_interval=(cfg_interval_min, cfg_interval_max),
+            cfg_scale=cfg_scale,
+            cfg_rescale=cfg_rescale
+        )
 
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt) 
@@ -253,9 +487,19 @@ def generate_cond(
 
     # Encode the audio to WAV format
     audio = rearrange(audio, "b d n -> d (b n)")
-    audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
 
-    # save as wav file
+    # 1. Ensure Float32
+    audio = audio.to(torch.float32)
+
+    # 2. Normalize safely (avoid div by zero if audio is silent)
+    peak = torch.max(torch.abs(audio))
+    if peak > 0:
+        audio = audio.div(peak)
+
+    # 3. Clamp strictly between -1 and 1
+    audio = audio.clamp(-1, 1).cpu()
+
+    # 4. Save directly as Float. Torchaudio will handle the 16-bit PCM encoding.
     torchaudio.save(output_wav, audio, sample_rate)
 
     # If file_format is other than wav, convert to other file format
@@ -280,13 +524,24 @@ def generate_cond(
         subprocess.run(cmd, shell=True, check=True)
     
     # Let's look at a nice spectrogram too
-    audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
+    # audio_spectrogram_image uses power_to_db with db_range=[35,120] which expects int16-scaled audio
+    audio_int16 = audio.clamp(-1, 1).mul(32767).to(torch.int16)
+    audio_spectrogram = audio_spectrogram_image(audio_int16, sample_rate=sample_rate)
+
+    # Build output images list
+    output_images = [(audio_spectrogram, "Final Spectrogram")]
+    if sigma_chart_image is not None:
+        output_images.append((sigma_chart_image, "Sigma & CFG Chart"))
+    output_images.extend(preview_images)
 
     # Asynchronously delete the files after returning the output file, so as to prevent clutter in the directory
     if file_naming in ["verbose", "prompt"]:
         delete_files_async([output_wav, output_filename], 30)
 
-    return (output_filename, [audio_spectrogram, *preview_images])
+    # Return audio as (sample_rate, numpy_array) for Gradio 6 compatibility
+    # Gradio 6 can't serve relative file paths; passing audio data directly works reliably
+    audio_numpy = audio.numpy().T  # [channels, samples] -> [samples, channels] for Gradio
+    return ((sample_rate, audio_numpy), output_images)
 
 #  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes. 
 def delete_files_async(filenames, delay):
@@ -351,11 +606,14 @@ def create_sampling_ui(model_config):
                     # Seed
                     seed_textbox = gr.Textbox(label="Seed (set to -1 for random seed)", value="-1")
 
-                    cfg_interval_min_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG interval min")
-                    cfg_interval_max_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=1.0, label="CFG interval max")
+                    cfg_interval_min_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG interval min (progress)")
+                    cfg_interval_max_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=1.0, label="CFG interval max (progress)")
 
                 with gr.Row():
                     cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG rescale amount")
+                    # Debug checkboxes
+                    print_sigma_checkbox = gr.Checkbox(label="Print sigma", value=False)
+                    chart_sigma_checkbox = gr.Checkbox(label="Chart sigma", value=False)
 
                 with gr.Row():
                     # Sampler params
@@ -399,6 +657,103 @@ def create_sampling_ui(model_config):
                 mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=10, label="Mask Start (sec)")
                 mask_maskend_slider = gr.Slider(minimum=0.0, maximum=sample_size//sample_rate, step=0.1, value=sample_size//sample_rate, label="Mask End (sec)")
 
+            with gr.Accordion("LatCH Guidance", open=False):
+                from pathlib import Path
+                latch_dir = Path(__file__).parent.parent.parent.parent / "latch_weights"
+                l_models = ["none"]
+                if latch_dir.exists():
+                    l_models.extend(sorted([f.name for f in latch_dir.glob("*.pt")]))
+
+                latch_enable_checkbox = gr.Checkbox(label="Enable LatCH (Overrides Sampler)", value=False)
+                with gr.Row():
+                    latch_rho_slider     = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                                                     value=1.0, label="Variance ρ")
+                    latch_mu_slider      = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                                                     value=1.0, label="Mean μ")
+                    latch_gamma_slider   = gr.Slider(minimum=0.0, maximum=2.0, step=0.05,
+                                                     value=0.3, label="Noise γ")
+                    latch_n_iter_slider  = gr.Slider(minimum=1, maximum=8, step=1,
+                                                     value=4, label="Mean iters")
+                    latch_log_checkbox   = gr.Checkbox(label="Log gradient norms", value=False)
+
+                gr.Markdown("**Slot 1**")
+                with gr.Row():
+                    latch_model_1_dropdown = gr.Dropdown(l_models, label="Model", value="none")
+                    latch_kind_1_dropdown  = gr.Dropdown(
+                        ["constant", "ramp_up", "ramp_down", "beat_grid"],
+                        label="Target kind", value="constant")
+                with gr.Row():
+                    latch_target_1_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                                                      value=1.0, label="Target value")
+                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.05,
+                                                      value=1.0, label="Weight")
+                with gr.Row():
+                    latch_start_1_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
+                                                     value=0.0, label="Start %")
+                    latch_end_1_slider   = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
+                                                     value=0.20, label="End %")
+
+                gr.Markdown("**Slot 2**")
+                with gr.Row():
+                    latch_model_2_dropdown = gr.Dropdown(l_models, label="Model", value="none")
+                    latch_kind_2_dropdown  = gr.Dropdown(
+                        ["constant", "ramp_up", "ramp_down", "beat_grid"],
+                        label="Target kind", value="constant")
+                with gr.Row():
+                    latch_target_2_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                                                      value=1.0, label="Target value")
+                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.05,
+                                                      value=1.0, label="Weight")
+                with gr.Row():
+                    latch_start_2_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
+                                                     value=0.0, label="Start %")
+                    latch_end_2_slider   = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
+                                                     value=0.20, label="End %")
+
+                def _on_latch_model_change(model_name, kind):
+                    md = _read_latch_metadata(latch_dir, model_name)
+                    stats = md.get("feature_stats", {}) if md else {}
+                    default_kind = md.get("target_kind_default", "constant") if md else "constant"
+                    if kind == "beat_grid":
+                        slider_min, slider_max, slider_step, slider_val = 30.0, 240.0, 1.0, 120.0
+                    elif stats and "min" in stats and "max" in stats:
+                        slider_min = float(stats["min"])
+                        slider_max = float(stats["max"]) * 2.0 if stats["max"] > 0 else 1.0
+                        slider_step = max((slider_max - slider_min) / 100.0, 1e-4)
+                        slider_val = float(stats.get("mean", (slider_min + slider_max) / 2.0))
+                    else:
+                        slider_min, slider_max, slider_step, slider_val = 0.0, 5.0, 0.05, 1.0
+                    return (
+                        gr.update(minimum=slider_min, maximum=slider_max,
+                                  step=slider_step, value=slider_val),
+                        gr.update(value=default_kind if model_name != "none" else kind),
+                    )
+
+                latch_model_1_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider, latch_kind_1_dropdown],
+                )
+                latch_model_2_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider, latch_kind_2_dropdown],
+                )
+
+                def _on_latch_kind_change(model_name, kind):
+                    return _on_latch_model_change(model_name, kind)[0]
+
+                latch_kind_1_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider],
+                )
+                latch_kind_2_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider],
+                )
+
             inputs = [
                 prompt, 
                 negative_prompt,
@@ -415,6 +770,8 @@ def create_sampling_ui(model_config):
                 cfg_interval_min_slider,
                 cfg_interval_max_slider,
                 cfg_rescale_slider,
+                print_sigma_checkbox,
+                chart_sigma_checkbox,
                 file_format_dropdown,
                 file_naming_dropdown,
                 cut_to_seconds_total_checkbox,
@@ -422,7 +779,25 @@ def create_sampling_ui(model_config):
                 init_noise_level_slider,
                 mask_maskstart_slider,
                 mask_maskend_slider,
-                inpaint_audio_input
+                inpaint_audio_input,
+                latch_enable_checkbox,
+                latch_model_1_dropdown,
+                latch_target_1_slider,
+                latch_weight_1_slider,
+                latch_start_1_slider,
+                latch_end_1_slider,
+                latch_model_2_dropdown,
+                latch_target_2_slider,
+                latch_weight_2_slider,
+                latch_start_2_slider,
+                latch_end_2_slider,
+                latch_rho_slider,
+                latch_mu_slider,
+                latch_gamma_slider,
+                latch_n_iter_slider,
+                latch_log_checkbox,
+                latch_kind_1_dropdown,
+                latch_kind_2_dropdown,
             ]
 
         with gr.Column():
@@ -454,7 +829,33 @@ def create_diffusion_cond_ui(model_config, in_model, in_model_half=True, gradio_
 
     model_half = in_model_half
 
-    js ="""function run_javascript_on_page_load(){
+    js_code ="""
+        // --- Gradio 6 Audio src workaround ---
+        // Gradio 6.8.0 has a bug where gr.Audio doesn't set the <audio> element's src.
+        // This workaround monitors the download link and syncs the URL to the audio element.
+        function fixAudioSrc() {
+            const outputAudioContainer = [...document.querySelectorAll('label')]
+                .find(label => label.textContent.trim() === 'Output audio')?.parentElement;
+            if (!outputAudioContainer) return;
+
+            const observer = new MutationObserver(() => {
+                const downloadLink = outputAudioContainer.querySelector('a[download]');
+                const audioEl = outputAudioContainer.querySelector('audio');
+                if (downloadLink && audioEl) {
+                    const url = downloadLink.href;
+                    if (url && url !== audioEl.src && !url.endsWith('#')) {
+                        console.log('[SAT] Fixing audio src:', url);
+                        audioEl.src = url;
+                        audioEl.load();
+                    }
+                }
+            });
+            observer.observe(outputAudioContainer, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+        }
+        // Run fix after a short delay to ensure DOM is ready
+        setTimeout(fixAudioSrc, 1000);
+
+        // --- Original SAT features ---
         const generateBtn = Array.from(document.querySelectorAll('button'))
             .find(btn => btn.innerText.trim() === 'Generate');
         function getAudioOutputPlayer () {
@@ -491,7 +892,6 @@ def create_diffusion_cond_ui(model_config, in_model, in_model_half=True, gradio_
         generateBtn.addEventListener('click', () => {
             if(listenersSetup) return;
             const interval = setInterval(() => {
-                console.log("...")
                 const audioEl = document.querySelector('audio');
                 if (audioEl?.src && audioEl.src !== window.location.href) {
                     setupListeners();
@@ -515,14 +915,12 @@ def create_diffusion_cond_ui(model_config, in_model, in_model_half=True, gradio_
             link.click();
             document.body.removeChild(link);
         }
-    }  
     """
 
-    with gr.Blocks(js=js, theme=gr.themes.Base()) as ui:
+    with gr.Blocks(head=f"<script>{js_code}</script>") as ui:
         if gradio_title:
             gr.Markdown("### %s" % gradio_title)
         with gr.Tab("Generation"):
             create_sampling_ui(model_config) 
 
-        # JavaScript to autoplay audio immediately after generation (if autoplay enabled)
     return ui
