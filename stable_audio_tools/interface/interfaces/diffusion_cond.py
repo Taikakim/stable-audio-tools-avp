@@ -69,7 +69,7 @@ def collect_sigma_data(step, sigma, progress, cfg_active):
         "cfg_active": cfg_active
     })
 
-def create_sigma_chart(steps, cfg_interval, cfg_scale, cfg_rescale):
+def create_sigma_chart(steps, cfg_interval, cfg_scale, cfg_rescale, latch_windows=None):
     """
     Create a chart showing sigma progression and CFG application.
     
@@ -158,6 +158,26 @@ def create_sigma_chart(steps, cfg_interval, cfg_scale, cfg_rescale):
         end_x = cfg_end_step if cfg_end_step is not None else step_nums[-1]
         ax.axvspan(start_x, end_x, alpha=0.2, color='#00FF00', label='CFG Active Region')
     
+    # LatCH guidance window(s): yellow band, orange where it overlaps the CFG-active region.
+    # start_pct/end_pct are fractions of the step schedule, so they map directly to step x.
+    if latch_windows:
+        max_step = max(step_nums) if step_nums else steps
+        cfg_lo = cfg_start_step if cfg_start_step is not None else step_nums[0]
+        cfg_hi = cfg_end_step if cfg_end_step is not None else step_nums[-1]
+        win_labeled = ov_labeled = False
+        for ls, le in latch_windows:
+            lo, hi = ls * max_step, le * max_step
+            if hi <= lo:
+                continue
+            ax.axvspan(lo, hi, alpha=0.18, color='#FFD400',
+                       label=None if win_labeled else 'LatCH window')
+            win_labeled = True
+            ov_lo, ov_hi = max(lo, cfg_lo), min(hi, cfg_hi)
+            if ov_hi > ov_lo:
+                ax.axvspan(ov_lo, ov_hi, alpha=0.35, color='#FF8C00',
+                           label=None if ov_labeled else 'LatCH ∩ CFG')
+                ov_labeled = True
+
     # Set labels and title
     ax.set_xlabel('Step', fontsize=10)
     ax.set_ylabel('Value (0-1)', fontsize=10)
@@ -453,11 +473,18 @@ def generate_cond(
     # Generate sigma chart if requested
     sigma_chart_image = None
     if chart_sigma:
+        latch_windows = []
+        if latch_enable:
+            if latch_model_1 and latch_model_1 != "none":
+                latch_windows.append((float(latch_start_1), float(latch_end_1)))
+            if latch_model_2 and latch_model_2 != "none":
+                latch_windows.append((float(latch_start_2), float(latch_end_2)))
         sigma_chart_image = create_sigma_chart(
             steps=steps,
             cfg_interval=(cfg_interval_min, cfg_interval_max),
             cfg_scale=cfg_scale,
-            cfg_rescale=cfg_rescale
+            cfg_rescale=cfg_rescale,
+            latch_windows=latch_windows,
         )
 
     # Filenaming convention
