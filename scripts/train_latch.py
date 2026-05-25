@@ -108,21 +108,26 @@ def _sample_target_stats(dataset, n: int = 200):
     }
 
 
-def _slider_spec(stats: dict) -> dict:
-    """Robust UI target-slider bounds + scale, from the sampled distribution.
+def _slider_spec(stats: dict, clamp=(None, None)) -> dict:
+    """UI target-slider bounds + scale.
 
-    Uses p1/p99 (not min/max) so outlier frames don't wreck the auto-range, and
-    picks a logarithmic scale only for strictly-positive features spanning a wide
-    dynamic range (e.g. spectral_flatness, spectral_kurtosis). dB / signed /
-    zero-touching features stay linear. Consumed by the gradio target slider.
+    Scale is chosen from the distribution (log only for strictly-positive features
+    spanning a wide dynamic range, e.g. spectral_flatness/kurtosis; dB/signed stay
+    linear). Bounds: a **clamped** feature (e.g. rms dB clamped to [-60,0]) uses the
+    clamp as the slider range so guidance can over-drive to the loud/bright extreme,
+    not just to p99 (the outliers are on the quiet end, already clamped). Unclamped
+    features use robust p1/p99 so outlier frames don't wreck the range.
     """
     if not stats:
         return {}
-    lo = stats.get("p1", stats.get("min"))
-    hi = stats.get("p99", stats.get("max"))
+    p_lo = stats.get("p1", stats.get("min"))
+    p_hi = stats.get("p99", stats.get("max"))
     scale = "linear"
-    if lo is not None and hi is not None and lo > 0 and hi / lo > 30:
+    if p_lo is not None and p_hi is not None and p_lo > 0 and p_hi / p_lo > 30:
         scale = "log"
+    cmin, cmax = clamp
+    lo = cmin if cmin is not None else p_lo
+    hi = cmax if cmax is not None else p_hi
     return {"slider_min": lo, "slider_max": hi, "slider_scale": scale}
 
 
@@ -197,7 +202,7 @@ def train(
     print(f"Target stats: {feature_stats}")
     target_kind_default = _default_kind_for(dataset.bare_feature)
     print(f"Default target kind for inference: {target_kind_default}")
-    slider = _slider_spec(feature_stats)   # robust UI bounds + linear/log scale
+    slider = _slider_spec(feature_stats, clamp=(clamp_min, clamp_max))  # UI bounds + linear/log scale
     print(f"Slider spec: {slider}")
 
     loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
