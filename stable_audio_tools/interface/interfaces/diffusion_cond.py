@@ -693,9 +693,9 @@ def create_sampling_ui(model_config):
 
                 latch_enable_checkbox = gr.Checkbox(label="Enable LatCH (Overrides Sampler)", value=False)
                 with gr.Row():
-                    latch_rho_slider     = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                    latch_rho_slider     = gr.Slider(minimum=0.0, maximum=30.0, step=0.1,
                                                      value=1.0, label="Variance ρ")
-                    latch_mu_slider      = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
+                    latch_mu_slider      = gr.Slider(minimum=0.0, maximum=30.0, step=0.1,
                                                      value=1.0, label="Mean μ")
                     latch_gamma_slider   = gr.Slider(minimum=0.0, maximum=2.0, step=0.05,
                                                      value=0.3, label="Noise γ")
@@ -712,7 +712,7 @@ def create_sampling_ui(model_config):
                 with gr.Row():
                     latch_target_1_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
                                                       value=1.0, label="Target value")
-                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.05,
+                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=50.0, step=0.1,
                                                       value=1.0, label="Weight")
                 with gr.Row():
                     latch_start_1_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
@@ -729,7 +729,7 @@ def create_sampling_ui(model_config):
                 with gr.Row():
                     latch_target_2_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
                                                       value=1.0, label="Target value")
-                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.05,
+                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=50.0, step=0.1,
                                                       value=1.0, label="Weight")
                 with gr.Row():
                     latch_start_2_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
