@@ -1,0 +1,52 @@
+# LatCH training config for the spectral features (regression, smooth_l1).
+# Generic: pass --feature spectral_{flatness,flux,skewness,kurtosis} per run.
+# test.target_value: auto -> the trainer brackets targets from the head's own
+# slider range, so this one config works for any feature's units.
+# Run: python scripts/train_latch.py --config latch_train_spectral.yaml --feature spectral_flatness
+
+feature: spectral_flatness     # overridden per run with --feature
+objective: rectified_flow
+epochs: 30
+lr: 3.0e-4
+batch_size: 64
+num_workers: 10
+val_frac: 0.02
+tag: v2
+save_dir: latch_weights
+latent_dir: /run/media/kim/Lehto/latents
+
+amd:
+  PYTORCH_TUNABLEOP_ENABLED: "1"
+  PYTORCH_TUNABLEOP_TUNING: "1"
+  PYTORCH_TUNABLEOP_VERBOSE: "1"
+  PYTORCH_TUNABLEOP_FILENAME: /home/kim/pytorch-tunings-7.2.2/tunableop_results.csv
+  PYTORCH_SDP_KERNEL_VERBOSE: "1"
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.6,max_split_size_mb:512
+  PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
+  HIP_FORCE_DEV_KERNARG: "1"
+  MIOPEN_FIND_MODE: "6"
+  MIOPEN_CUSTOM_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/miopen/cache
+  MIOPEN_USER_DB_PATH: /home/kim/pytorch-tunings-7.2.2/miopen/db
+  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+  TRITON_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/triton_cache
+  OMP_NUM_THREADS: "8"
+
+wandb: true
+wandb_project: latch
+tensorboard: false
+
+test:
+  model_config: models/checkpoints/small/base_model_config.json
+  ckpt_path:    models/checkpoints/small/base_model.ckpt
+  every_epochs: 5
+  steps: 50
+  prompt: "trippy 124BPM acid techno, dry snappy kick and bassline, korg, roland, impactful, modular, eurorack, aggressive, syncopated"
+  seed: 42
+  cfg_scale: 3.0
+  kind: constant
+  target_value: auto          # bracket from the head's slider range (feature-agnostic)
+  window: [0.4, 1.0]
+  gain: 8.0
+  gamma: 0.3
+  n_iter: 6
+  weight: 5.0
