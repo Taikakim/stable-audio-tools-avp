@@ -325,8 +325,14 @@ def train(
             win = test_cfg.get("window", [0.5, 1.0])
             n_steps = int(test_cfg.get("steps", 50))
             # target_value may be a scalar OR a bracket list -> one clip per value
-            tv = test_cfg.get("target_value", feature_stats.get("max", 1.0))
-            values = tv if isinstance(tv, (list, tuple)) else [tv]
+            tv = test_cfg.get("target_value")
+            if tv is None or tv == "auto":
+                # auto-bracket from this head's own slider range -> one config fits any feature
+                lo = slider.get("slider_min", feature_stats.get("min", 0.0))
+                hi = slider.get("slider_max", feature_stats.get("max", 1.0))
+                values = [lo + (hi - lo) * f for f in (0.25, 0.5, 0.85)]
+            else:
+                values = tv if isinstance(tv, (list, tuple)) else [tv]
             audio_logs = {}
             for val in values:
                 audio = generate_diffusion_cond(
