@@ -715,8 +715,19 @@ def create_sampling_ui(model_config):
                     stats = md.get("feature_stats", {}) if md else {}
                     default_kind = md.get("target_kind_default", "constant") if md else "constant"
                     if kind == "beat_grid":
+                        # target value is BPM, not the feature value
                         slider_min, slider_max, slider_step, slider_val = 30.0, 240.0, 1.0, 120.0
+                    elif md and md.get("slider_min") is not None and md.get("slider_max") is not None:
+                        # robust p1/p99 bounds from training (outlier-safe; preferred).
+                        # NOTE: slider_scale=="log" (spectral_flatness/kurtosis) still renders
+                        # linearly for now — a true log slider is pending (no log head trained yet).
+                        slider_min = float(md["slider_min"])
+                        slider_max = float(md["slider_max"])
+                        slider_step = max((slider_max - slider_min) / 100.0, 1e-4)
+                        slider_val = float(stats.get("mean", (slider_min + slider_max) / 2.0))
+                        slider_val = min(max(slider_val, slider_min), slider_max)
                     elif stats and "min" in stats and "max" in stats:
+                        # legacy heads without robust bounds
                         slider_min = float(stats["min"])
                         slider_max = float(stats["max"]) * 2.0 if stats["max"] > 0 else 1.0
                         slider_step = max((slider_max - slider_min) / 100.0, 1e-4)

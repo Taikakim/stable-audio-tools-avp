@@ -102,8 +102,28 @@ def _sample_target_stats(dataset, n: int = 200):
         "std":  float(arr.std()),
         "min":  float(arr.min()),
         "max":  float(arr.max()),
+        "p1":   float(np.percentile(arr, 1)),
+        "p99":  float(np.percentile(arr, 99)),
         "n_samples": len(samples),
     }
+
+
+def _slider_spec(stats: dict) -> dict:
+    """Robust UI target-slider bounds + scale, from the sampled distribution.
+
+    Uses p1/p99 (not min/max) so outlier frames don't wreck the auto-range, and
+    picks a logarithmic scale only for strictly-positive features spanning a wide
+    dynamic range (e.g. spectral_flatness, spectral_kurtosis). dB / signed /
+    zero-touching features stay linear. Consumed by the gradio target slider.
+    """
+    if not stats:
+        return {}
+    lo = stats.get("p1", stats.get("min"))
+    hi = stats.get("p99", stats.get("max"))
+    scale = "linear"
+    if lo is not None and hi is not None and lo > 0 and hi / lo > 30:
+        scale = "log"
+    return {"slider_min": lo, "slider_max": hi, "slider_scale": scale}
 
 
 def _default_kind_for(feature_name: str) -> str:
@@ -177,6 +197,8 @@ def train(
     print(f"Target stats: {feature_stats}")
     target_kind_default = _default_kind_for(dataset.bare_feature)
     print(f"Default target kind for inference: {target_kind_default}")
+    slider = _slider_spec(feature_stats)   # robust UI bounds + linear/log scale
+    print(f"Slider spec: {slider}")
 
     loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
                         num_workers=num_workers, persistent_workers=num_workers > 0)
@@ -396,6 +418,7 @@ def train(
             "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine
             "huber_beta": huber_beta,     # SmoothL1 beta (None unless loss_type==smooth_l1)
             "target_clamp": [clamp_min, clamp_max],
+            **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
         }
