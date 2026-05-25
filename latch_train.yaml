@@ -33,12 +33,12 @@ test:
   # ---- LatCH guidance hyperparameters (see memory: latch-sigmas-schedule / latch-paper) ----
   kind: ramp_up               # target envelope shape: constant | ramp_up | ramp_down | beat_grid(BPM)
   target_value: [-50, -30, -10]  # requested feature level(s); scalar OR bracket -> one clip per value (dB for rms)
-  window: [0.2, 0.8]          # [start_pct, end_pct] of the step schedule where guidance is applied
-  gain: 5.0                   # sets both rho & mu; overall guidance strength (paper's 0.03 is inaudible here)
+  window: [0.4, 1.0]          # [start_pct, end_pct]; END AT 1.0 — RF guidance power lives in the high-α tail (~80-98%)
+  gain: 8.0                   # sets both rho & mu; overall guidance strength (paper's 0.03 is inaudible here; ~3 clear, ~10 strong)
   # rho: 5.0                  # (optional) variance-guidance strength on the noisy latent z_t; defaults to gain
   # mu:  5.0                  # (optional) mean-guidance strength on the clean estimate z_{0|t}; defaults to gain
   gamma: 0.3                  # input noise augmentation std (smooths the guidance gradient; paper value)
-  n_iter: 4                   # mean-guidance iterations per step (paper value; higher = stronger, slower)
+  n_iter: 6                   # mean-guidance iterations per step (paper=4; higher = stronger, slower)
   weight: 1.0                 # per-guide loss multiplier (matters when stacking multiple heads)
 
   # AMD/ROCm environment for this training run — applied BEFORE `import torch`.
