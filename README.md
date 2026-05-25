@@ -1,6 +1,6 @@
 # stable-audio-tools
 
-** This is a mostly personal fork to keep track of my changes and simplify my Colab workflow **
+> **Fork by [aavepyora.online](https://aavepyora.online).** A personal fork of Stability AI's `stable-audio-tools` that adds **LatCH (Latent-Control Heads)** — fine-grained, training-free control of generation (bass energy, spectral texture, rhythm, key, …). The LatCH trainer and guidance were implemented from Stability AI's research paper *Low-Resource Guidance for Controllable Latent Audio Diffusion* (arXiv:2603.04366). See [`scripts/LATCH_README.md`](scripts/LATCH_README.md).
 
 Training and inference code for audio generation models
 

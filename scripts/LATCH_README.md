@@ -1,6 +1,6 @@
 # Latent-Control Heads (LatCH) Module
 
-This directory contains the implementation of **LatCH-F** (Forward-Simulated Noise Conditioning) for Stable Audio Open, based on the paper *Low-Resource Guidance for Controllable Latent Audio Diffusion*.
+This directory contains the implementation of **LatCH-F** (Forward-Simulated Noise Conditioning) for Stable Audio Open, written by [aavepyora.online](https://aavepyora.online) from Stability AI's research paper *Low-Resource Guidance for Controllable Latent Audio Diffusion* (arXiv:2603.04366).
 
 ## File Structure
 
