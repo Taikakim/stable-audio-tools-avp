@@ -123,8 +123,8 @@ Per slot:
 
 - **Model** — dropdown of files in `latch_weights/`.
 - **Target kind** — `constant` (uniform value over time), `ramp_up` / `ramp_down` (linear envelope), `beat_grid` (target value is BPM, places 1.0 logits at beat positions).
-- **Target value** — slider auto-ranged to the loaded checkpoint's `feature_stats`.
-- **Weight** — multiplied into the per-guide loss before differentiation (multi-control balancing).
+- **Target value** — slider auto-ranged to the checkpoint's robust `slider_min`/`slider_max` (p1/p99) when present, else `feature_stats` min/max; in the feature's own units (dB for rms, BPM for `beat_grid`, etc.).
+- **Weight** — multiplied into the per-guide loss, so it **scales the guidance gradient**. Because the ρ/μ sliders cap at 5.0, **raise Weight (up to 10) to push harder** — effective strength ≈ `weight · ρ`. It's also the per-head balance when stacking guides.
 - **Start % / End %** — selective-TFG window as a fraction of the step schedule. NOTE: for the rectified-flow Small model, σ stays near 1 (α≈0) for the early steps, and guidance strength scales with α, so the **first ~20% is a dead zone** — put the window in the **back half (≈0.5–1.0)** where guidance actually has power. (Window is step-index based, so the right values differ between RF and v models.)
 
 ## Tuning the controls per feature
@@ -132,11 +132,13 @@ Per slot:
 The strength knobs are universal; what changes per feature is the **target value's meaning**, the sensible **kind**, and the **loss** (auto-selected from the checkpoint).
 
 ### Universal strength knobs (start here)
-- **Window** `[0.5, 1.0]` — guidance lives in the low-σ / high-α back half (see Start/End note above).
-- **Gain ρ = μ ≈ 3–10** — the paper's 0.03 is inaudible on this setup. ρ drives variance guidance (gradient on the noisy latent); μ drives mean guidance (gradient on the clean estimate `z_{0|t}`) — μ usually does the meaningful work; keep them equal unless experimenting.
-- **Weight 1.0** for a single head; only use it to *balance* when stacking multiple heads (e.g. bass 1.0 + beat 0.5).
-- **γ 0.3**, **iters 4** — leave as-is; γ smooths the guidance (raise to soften), iters strengthen mean guidance per step (slower).
-- **Calibration reality:** relative tracking is reliable (more target → more feature, in order); absolute level is *offset* — if you want to truly hit a value, push it high and/or raise gain. Verify a head with the closed-loop pattern in `latch_verify_rms.py`.
+- **Window `[0.4, 1.0]` — and *end at 1.0*.** For rectified-flow, guidance power lives in the high-α tail (~80–98% of steps); ending early (e.g. 0.8) discards the strongest region, and the first ~20% is a dead zone (α≈0).
+- **ρ (Variance) and μ (Mean) — overall strength.** ρ pushes the noisy latent `z_t`; μ pushes the clean estimate `z_{0|t}` (usually the meaningful one). Keep them equal. The paper's 0.03 is inaudible here, and **the UI sliders cap at 5.0.**
+- **Weight — your real loudness knob.** It multiplies the guidance gradient, so `weight · ρ` is the effective strength. Since ρ/μ cap at 5, **raise Weight (up to 10) to push past that** — e.g. weight 5 × ρ 5 ≈ 25, far above the gain-8 baseline. Start at 1 for a single head and raise until audible; for *multiple* heads it also sets their relative balance.
+- **γ 0.3, iters 4–8** — γ smooths the gradient (raise to soften); more iters strengthen mean guidance per step (slower).
+- **Hear it via A/B at opposite targets, same seed.** Render the *same* prompt+seed at the target's two extremes (e.g. `air` −14 dB vs −55 dB) — comparing extremes is far more obvious than one clip vs. none.
+- **Per-band perceptibility differs:** `rms_energy_bass`/`body` are the punchiest; `air` (2.5–22 kHz sparkle) and other high-frequency features are inherently subtler — lean harder on Weight there.
+- **Calibration & verification (use MIR, don't hand-roll):** relative tracking is reliable (more target → more feature, in order); absolute level is *offset*. To **verify** a head controls its feature, run the generated audio through MIR's real extractors (`/home/kim/Projects/mir/src/spectral/`; `latch_verify_rms.py` wraps them for rms). To **bracket** sensible target ranges, use MIR's `plots/build_dataset_stats.py` rather than ad-hoc queries.
 
 ### Per-feature target value & kind
 
