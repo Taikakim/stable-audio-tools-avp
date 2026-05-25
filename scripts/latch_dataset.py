@@ -128,10 +128,16 @@ class LatCHDataset(Dataset):
         max_frames: int = 256,
         db_path: Optional[str] = None,
         stem_suffixes=None,
+        clamp_min: Optional[float] = None,
+        clamp_max: Optional[float] = None,
     ):
         self.latent_dir      = Path(latent_dir)
         self.info_dir        = Path(info_dir) if info_dir else None
         self.max_frames      = max_frames
+        # Optional target clamp (e.g. dB-floor for rms_energy_* to tame near-silent
+        # outliers). Applied to every returned target; keep train & inference consistent.
+        self.clamp_min       = clamp_min
+        self.clamp_max       = clamp_max
 
         # Canonical name is bare (no _ts).  We always append _ts for DB lookups.
         self.bare_feature    = target_feature.removesuffix("_ts")
@@ -235,8 +241,11 @@ class LatCHDataset(Dataset):
                     val = float(feat_val)
                     target = np.full((1, self.max_frames), val, dtype=np.float32)
 
+                if self.clamp_min is not None or self.clamp_max is not None:
+                    target = np.clip(target, self.clamp_min, self.clamp_max)
+
                 latent_t = torch.from_numpy(latent)          # [64, T]
-                target_t = torch.from_numpy(target)          # [C, T]
+                target_t = torch.from_numpy(np.ascontiguousarray(target))  # [C, T]
                 return latent_t, target_t
 
             except Exception:

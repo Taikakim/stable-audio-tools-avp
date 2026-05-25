@@ -11,6 +11,7 @@ _rocm_env = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_rocm_env)
 _rocm_env.apply_profile("training")
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -95,16 +96,26 @@ def train(
     save_dir="latch_weights",
     db_path=None,
     objective="rectified_flow",
+    val_frac=0.02,
+    val_seed=0,
 ):
     os.makedirs(save_dir, exist_ok=True)
     print(f"Forward-noising schedule: objective={objective} "
           f"(MUST match the diffusion model this head will guide)")
+
+    # dB-floor clamp for rms_energy_* targets: near-silent crops read down to ~-97 dB
+    # and dominate the loss. Clamp to [-60, 0] (sub-60 dB is inaudible). Applied in the
+    # dataset so train/val targets AND feature_stats are all consistent.
+    clamp_min, clamp_max = (-60.0, 0.0) if target_feature.startswith("rms_energy") else (None, None)
+    if clamp_min is not None:
+        print(f"Target clamp: [{clamp_min}, {clamp_max}] dB (rms feature)")
 
     # Init Dataset
     dataset = LatCHDataset(
         latent_dir, info_dir,
         target_feature=target_feature,
         db_path=db_path,
+        clamp_min=clamp_min, clamp_max=clamp_max,
     )
     if len(dataset) == 0:
         print("No valid latent-INFO pairs found. Make sure external drives are mounted.")
@@ -115,15 +126,24 @@ def train(
     out_channels = sample_target.shape[0]  # (C, T) → C
     print(f"Target '{target_feature}': out_channels={out_channels}, seq_len={sample_target.shape[1]}")
 
-    # Compute target distribution stats for inference UI
-    print("Sampling target stats from dataset (up to 200 items)...")
-    feature_stats = _sample_target_stats(dataset, n=200)
+    # Deterministic train/val split (seeded so val never leaks into train across runs)
+    n_val = max(1, int(val_frac * len(dataset)))
+    n_train = len(dataset) - n_val
+    split_gen = torch.Generator().manual_seed(val_seed)
+    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=split_gen)
+    print(f"Split: {n_train} train / {n_val} val (val_frac={val_frac})")
+
+    # Compute target stats from the TRAIN split only (don't peek at val)
+    print("Sampling target stats from train split (up to 200 items)...")
+    feature_stats = _sample_target_stats(train_ds, n=200)
     print(f"Target stats: {feature_stats}")
     target_kind_default = _default_kind_for(dataset.bare_feature)
     print(f"Default target kind for inference: {target_kind_default}")
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
                         num_workers=4, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False,
+                            num_workers=2, persistent_workers=True)
 
     # Init Model — out_channels adapts to the target feature shape
     model = LatCH(in_channels=64, out_channels=out_channels, dim=256, depth=6, num_heads=8).to(device)
@@ -149,11 +169,40 @@ def train(
         criterion = sparse_weighted_bce
         loss_type = "bce_logits"  # head emits logits; inference guidance must match
     else:
-        criterion = nn.MSELoss()
-        loss_type = "mse"
-        
-    print(f"Starting training on feature: {target_feature} with {len(dataset)} items.")
-    
+        # Robust regression loss (Huber/SmoothL1): quadratic for small errors, linear
+        # beyond beta, so outliers (e.g. clamped silent crops) don't dominate. beta is
+        # auto-scaled to the feature (half its std) so it's in the right units.
+        std = float(feature_stats.get("std") or 1.0)
+        huber_beta = max(1e-3, round(0.5 * std, 4))
+        criterion = nn.SmoothL1Loss(beta=huber_beta)
+        loss_type = "smooth_l1"
+        print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
+
+    huber_beta = locals().get("huber_beta")  # None unless regression branch set it
+
+    def validate():
+        """Held-out loss with FIXED noise/timesteps so it's comparable across epochs."""
+        model.eval()
+        vg = torch.Generator(device=device).manual_seed(1234)
+        losses = []
+        with torch.no_grad():
+            for v_lat, v_tgt in val_loader:
+                v_lat = v_lat.to(device); v_tgt = v_tgt.to(device)
+                Bv = v_lat.size(0)
+                tv = torch.rand((Bv,), device=device, generator=vg)
+                a, s = forward_noise_schedule(tv, objective)
+                z = a.view(Bv, 1, 1) * v_lat + s.view(Bv, 1, 1) * torch.randn(
+                    v_lat.shape, device=device, generator=vg)
+                with torch.cuda.amp.autocast():
+                    losses.append(criterion(model(z, tv), v_tgt).item())
+        model.train()
+        if not losses:
+            return float("nan"), float("nan")
+        return float(np.mean(losses)), float(np.median(losses))
+
+    print(f"Starting training on feature: {target_feature} ({n_train} train items).")
+
+    best_val_median = float("inf")
     scaler = torch.cuda.amp.GradScaler()
     
     for epoch in range(epochs):
@@ -193,17 +242,29 @@ def train(
             pbar.set_postfix({'loss': loss.item()})
             
         avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
-        
+        val_mean, val_median = validate()
+        print(f"Epoch {epoch+1}: train_avg={avg_loss:.4f}  "
+              f"val_mean={val_mean:.4f}  val_median={val_median:.4f}")
+
         checkpoint = {
             "state_dict": model.state_dict(),
             "feature_name": target_feature,
             "feature_stats": feature_stats,
             "target_kind_default": target_kind_default,
             "noise_schedule": objective,  # forward-noising convention the head expects
-            "loss_type": loss_type,       # mse | bce_logits | cosine
+            "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine
+            "huber_beta": huber_beta,     # SmoothL1 beta (None unless loss_type==smooth_l1)
+            "target_clamp": [clamp_min, clamp_max],
+            "val_mean": val_mean,
+            "val_median": val_median,
         }
         torch.save(checkpoint, os.path.join(save_dir, f"latch_{target_feature}_ep{epoch+1}.pt"))
+
+        # Keep a best-by-val-median copy (the outlier-robust convergence signal)
+        if val_median == val_median and val_median < best_val_median:  # not NaN and improved
+            best_val_median = val_median
+            torch.save(checkpoint, os.path.join(save_dir, f"latch_{target_feature}_best.pt"))
+            print(f"  ↳ new best (val_median={val_median:.4f}) → latch_{target_feature}_best.pt")
 
 if __name__ == "__main__":
     import argparse
@@ -227,6 +288,8 @@ if __name__ == "__main__":
         help="Override path to timeseries.db (default: /home/kim/Projects/mir/data/timeseries.db)"
     )
     parser.add_argument("--save-dir", type=str, default="latch_weights")
+    parser.add_argument("--val-frac", type=float, default=0.02,
+                        help="fraction held out for validation (deterministic split)")
     parser.add_argument(
         "--objective", type=str, default="rectified_flow",
         choices=["rectified_flow", "rf_denoiser", "v"],
@@ -244,4 +307,5 @@ if __name__ == "__main__":
         db_path=args.db_path,
         save_dir=args.save_dir,
         objective=args.objective,
+        val_frac=args.val_frac,
     )

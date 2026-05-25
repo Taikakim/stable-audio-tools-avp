@@ -238,6 +238,7 @@ def generate_diffusion_cond(
                 "weight": cfg["weight"],
                 "start_pct": cfg["start_pct"], "end_pct": cfg["end_pct"],
                 "loss_type": latch.metadata.get("loss_type", "mse"),
+                "huber_beta": latch.metadata.get("huber_beta") or 1.0,
             })
 
         sigma_max_val = sampler_kwargs.get("sigma_max", 1.0)

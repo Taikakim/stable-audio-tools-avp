@@ -460,13 +460,14 @@ def sample_rf(
     else:
         raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
-def _make_latch_criterion(loss_type):
+def _make_latch_criterion(loss_type, huber_beta=1.0):
     """Guidance loss matching how the head was trained (see train_latch.py).
 
     bce_logits : head emits logits (beat/onset) — score with BCEWithLogits so the
                  gradient matches training; MSE on logits points the wrong way.
     cosine     : hpcp/chroma direction similarity.
-    mse        : everything else (rms, spectral_*, tonic, …).
+    smooth_l1  : robust (Huber) regression, beta from the checkpoint.
+    mse        : legacy regression heads.
     """
     if loss_type == "bce_logits":
         return torch.nn.BCEWithLogitsLoss()
@@ -476,6 +477,8 @@ def _make_latch_criterion(loss_type):
             t = target / (target.norm(dim=1, keepdim=True) + 1e-8)
             return (1.0 - (p * t).sum(dim=1)).mean()
         return _cos
+    if loss_type == "smooth_l1":
+        return torch.nn.SmoothL1Loss(beta=float(huber_beta or 1.0))
     return torch.nn.MSELoss()
 
 
@@ -543,7 +546,7 @@ def sample_euler_latch_guided(
     for g in latch_guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"]   = int(num_steps * g["end_pct"])
-        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"))
+        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0))
 
     for i, (t_curr, t_prev) in enumerate(
         tqdm(zip(t[:-1], t[1:]), disable=disable_tqdm, total=num_steps)

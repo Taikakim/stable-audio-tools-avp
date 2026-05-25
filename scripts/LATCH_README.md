@@ -14,8 +14,9 @@ The PyTorch `Dataset` used to feed latent/feature pairs into the training loop.
 
 ### 3. `train_latch.py`
 The noise-conditioned pre-training loop.
-*   **Key Features**: Uses a continuous Variance-Preserving (VP) noise schedule matching SAO. It dynamically switches loss functions based on your target (e.g., Sparse-weighted BCE for pitch, BCE for beats/syncopation, and MSE for RMS intensity). 
-*   **Usage**: `python scripts/train_latch.py --feature rms_broadband --epochs 10`
+*   **Key Features**: Forward-noises latents with the schedule of the diffusion model the head will guide — pass `--objective` (the Small base model is `rectified_flow`, i.e. linear `z_t=(1-t)·z0+t·noise`, **not** VP cosine). It switches loss by feature (BCE-logits for beat/onset, cosine for hpcp/chroma, MSE otherwise) and records `noise_schedule` + `loss_type` in the checkpoint so inference matches.
+*   **Usage**: `python scripts/train_latch.py --feature rms_energy_bass --objective rectified_flow --epochs 10`
+*   **Critical**: a head trained for the wrong objective produces unreliable guidance. Inference warns if a head's `noise_schedule` ≠ the model objective.
 
 ### 4. `generate_latch_guided.py`
 The inference module demonstrating how to apply LatCH-driven TFG (Training-Free Guidance) to an Euler sampler step.
@@ -83,7 +84,36 @@ Per slot:
 - **Target kind** — `constant` (uniform value over time), `ramp_up` / `ramp_down` (linear envelope), `beat_grid` (target value is BPM, places 1.0 logits at beat positions).
 - **Target value** — slider auto-ranged to the loaded checkpoint's `feature_stats`.
 - **Weight** — multiplied into the per-guide loss before differentiation (multi-control balancing).
-- **Start % / End %** — selective-TFG window (paper §2.3 — default 0–20%).
+- **Start % / End %** — selective-TFG window as a fraction of the step schedule. NOTE: for the rectified-flow Small model, σ stays near 1 (α≈0) for the early steps, and guidance strength scales with α, so the **first ~20% is a dead zone** — put the window in the **back half (≈0.5–1.0)** where guidance actually has power. (Window is step-index based, so the right values differ between RF and v models.)
+
+## Tuning the controls per feature
+
+The strength knobs are universal; what changes per feature is the **target value's meaning**, the sensible **kind**, and the **loss** (auto-selected from the checkpoint).
+
+### Universal strength knobs (start here)
+- **Window** `[0.5, 1.0]` — guidance lives in the low-σ / high-α back half (see Start/End note above).
+- **Gain ρ = μ ≈ 3–10** — the paper's 0.03 is inaudible on this setup. ρ drives variance guidance (gradient on the noisy latent); μ drives mean guidance (gradient on the clean estimate `z_{0|t}`) — μ usually does the meaningful work; keep them equal unless experimenting.
+- **Weight 1.0** for a single head; only use it to *balance* when stacking multiple heads (e.g. bass 1.0 + beat 0.5).
+- **γ 0.3**, **iters 4** — leave as-is; γ smooths the guidance (raise to soften), iters strengthen mean guidance per step (slower).
+- **Calibration reality:** relative tracking is reliable (more target → more feature, in order); absolute level is *offset* — if you want to truly hit a value, push it high and/or raise gain. Verify a head with the closed-loop pattern in `latch_verify_rms.py`.
+
+### Per-feature target value & kind
+
+| Feature(s) | Target value means | Range / units | Loss (auto) | Kind | Control |
+|---|---|---|---|---|---|
+| `rms_energy_{bass,body,mid,air}` | loudness of that band | dB, ~[−97, −4] (higher = louder) | MSE | `constant` (steady), `ramp_up/down` (swell/fade) | **strong, local** — verified bass corr 1.000 |
+| `spectral_flatness` | tonal↔noisy texture | ~[0, 1] (higher = noisier/airier) | MSE | `constant` / `ramp` | strong-ish, local |
+| `spectral_{flux,skewness,kurtosis}` | spectral motion / shape | feature-specific | MSE | `constant` / `ramp` | moderate |
+| `beat_activations`, `downbeat_activations`, `onsets_activations` | **BPM** (grid spacing) | beats/min | BCE-logits | **`beat_grid`** (places activations at beat positions) | rhythmic; needs `beat_grid` kind |
+| `hpcp` | 12-d chroma direction | unit-ish vector | cosine | `constant` | steers harmonic content (direction, not magnitude); experimental |
+| `tonic` | pitch class | 0–11, **circular** | MSE | `constant` | **weak/ill-posed** — MSE on a circular quantity; prefer `hpcp` for harmonic steering |
+| `tonic_strength` | how key-defined | ~[0, 1] | MSE | `constant` | moderate |
+
+Notes:
+- The **Target value slider auto-ranges** to the head's `feature_stats`, so it's already in the right units — pick within that range.
+- **dB features** are negative; "more bass" means a *less negative* value (toward −5), "less" means toward −60.
+- **Beat/onset**: use `beat_grid` and set the target value to the desired **BPM**; these are logit targets (BCE), so guidance shapes *where* energy lands in time, not a level.
+- **hpcp/tonic** are the weakest controls here — global/harmonic and (for tonic) circular; don't expect dB-style precision.
 
 ## Known limitations vs the paper
 
