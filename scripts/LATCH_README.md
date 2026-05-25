@@ -44,6 +44,47 @@ spectral_skewness
 tonic_strength
 tonic
 
+## Building the training database
+
+LatCH heads are trained on `(latent, feature)` pairs. The feature side is a
+SQLite **time-series database** produced by the companion project
+[**mir-feature-extraction**](https://github.com/Taikakim/mir-feature-extraction)
+(arXiv-feature MIR pipeline). `train_latch.py` reads it via `latch_dataset.py`.
+
+**What the DB looks like** (`data/timeseries.db`):
+- SQLite in WAL mode (safe for concurrent worker writes). One row per crop:
+  `ts(key TEXT PRIMARY KEY, data BLOB)`.
+- `key` = the crop's filename stem (e.g. `"Artist - Title_0"`) — the **same stem
+  as the pre-encoded latent `.npy`**, which is how the two are paired.
+- `data` = `gzip(msgpack({field: {s: shape, b: float32 bytes}}))` (~13–25 KB/crop).
+- Every field is resampled to **256 frames (~21.5 Hz)** to match the SAO latent
+  grid, so target↔latent alignment is exact. Fields are the `*_ts` features
+  listed under *Keys* above.
+
+**How to build it** (config-driven):
+```bash
+# in the mir-feature-extraction repo
+python -m venv mir && source mir/bin/activate
+pip install -r requirements.txt
+python scripts/download_essentia_models.py          # HPCP / AI models
+python src/master_pipeline.py --config config/master_pipeline.yaml
+```
+`config/master_pipeline.yaml` sets the audio paths and the stages
+(`organize → track_analysis → cropping → crop_analysis`). The DB is populated in
+the **`crop_analysis`** stage: `src/spectral/timeseries_features.py::extract_timeseries`
+computes the 256-frame `_ts` arrays (band RMS in dB, spectral moments, HPCP,
+beat/onset activations, tonic) and writes them with `db.put(crop_stem, {...})`.
+
+- To (re)populate **only** the time-series on an existing crop set, run with
+  `stages: { crop_analysis: true }` and the others `false`.
+- To bootstrap from pre-existing `.INFO` time-series, use
+  `scripts/migrate_timeseries_to_db.py`.
+- Check coverage: `scripts/verify_features.py`, or `TimeseriesDB.open().count()`.
+
+**Point the trainer at it** — default path is `/home/kim/Projects/mir/data/timeseries.db`;
+override with `--db-path` or `db_path:` in `latch_train.yaml`. The latent `.npy`
+files (same stems) go in `latent_dir`.
+
 ## Checkpoint Format (v2)
 
 Checkpoints saved by `train_latch.py` are now wrapped dicts:
