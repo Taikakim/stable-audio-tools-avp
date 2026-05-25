@@ -1,15 +1,44 @@
 import os
+import sys
 
-# Apply the ROCm "training" profile from rocm_env.yaml BEFORE importing torch.
-# Loaded standalone via importlib so the stable_audio_tools package __init__
-# (which imports torch) does NOT run first — values live only in rocm_env.yaml.
-import importlib.util as _ilu
-from pathlib import Path as _Path
-_re_path = _Path(__file__).resolve().parent.parent / "stable_audio_tools" / "rocm_env.py"
-_spec = _ilu.spec_from_file_location("_sat_rocm_env", _re_path)
-_rocm_env = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_rocm_env)
-_rocm_env.apply_profile("training")
+# Apply the AMD/ROCm env BEFORE importing torch. Prefer the `amd:` section of the
+# --config YAML (so a run is self-contained); otherwise fall back to rocm_env.yaml's
+# `training` profile. (The package/inference path applies rocm_env.yaml on import.)
+def _early_arg(flag):
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+def _apply_amd_env():
+    cfg_path = _early_arg("--config")
+    amd = None
+    if cfg_path and os.path.exists(cfg_path):
+        import yaml
+        amd = (yaml.safe_load(open(cfg_path)) or {}).get("amd")
+    if amd:
+        for k, v in amd.items():
+            os.environ.setdefault(k, str(v))
+        for k in ("TRITON_CACHE_DIR", "MIOPEN_CUSTOM_CACHE_DIR", "MIOPEN_USER_DB_PATH"):
+            p = os.environ.get(k)
+            if p:
+                os.makedirs(p, exist_ok=True)
+        tf = os.environ.get("PYTORCH_TUNABLEOP_FILENAME")
+        if tf and os.path.dirname(tf):
+            os.makedirs(os.path.dirname(tf), exist_ok=True)
+        print(f"[amd] applied {len(amd)} env vars from {cfg_path} (amd: section)")
+    else:
+        import importlib.util as _ilu
+        from pathlib import Path as _Path
+        _re = _Path(__file__).resolve().parent.parent / "stable_audio_tools" / "rocm_env.py"
+        _spec = _ilu.spec_from_file_location("_sat_rocm_env", _re)
+        _m = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        _m.apply_profile("training")
+
+_apply_amd_env()
 
 import numpy as np
 import torch
@@ -98,8 +127,17 @@ def train(
     objective="rectified_flow",
     val_frac=0.02,
     val_seed=0,
+    tag="",
+    num_workers=4,
+    use_tensorboard=False,
+    use_wandb=False,
+    wandb_project="latch",
+    test_cfg=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
+    # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
+    # so it's distinguishable in latch_weights/ and the UI dropdown.
+    stem = f"latch_{target_feature}" + (f"_{tag}" if tag else "")
     print(f"Forward-noising schedule: objective={objective} "
           f"(MUST match the diffusion model this head will guide)")
 
@@ -141,9 +179,10 @@ def train(
     print(f"Default target kind for inference: {target_kind_default}")
 
     loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
-                        num_workers=4, persistent_workers=True)
+                        num_workers=num_workers, persistent_workers=num_workers > 0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False,
-                            num_workers=2, persistent_workers=True)
+                            num_workers=max(1, num_workers // 2), persistent_workers=num_workers > 0)
+    print(f"DataLoader workers: {num_workers} (train) / {max(1, num_workers // 2)} (val)")
 
     # Init Model — out_channels adapts to the target feature shape
     model = LatCH(in_channels=64, out_channels=out_channels, dim=256, depth=6, num_heads=8).to(device)
@@ -203,8 +242,105 @@ def train(
     print(f"Starting training on feature: {target_feature} ({n_train} train items).")
 
     best_val_median = float("inf")
+
+    # --- optional experiment logging (TensorBoard / W&B, opt-in) ---
+    run_cfg = {
+        "feature": target_feature, "objective": objective, "loss_type": loss_type,
+        "huber_beta": huber_beta, "target_clamp": [clamp_min, clamp_max],
+        "lr": lr, "batch_size": batch_size, "epochs": epochs, "val_frac": val_frac,
+        "out_channels": out_channels, "tag": tag,
+        **{f"stat_{k}": v for k, v in feature_stats.items()},
+    }
+    tb = None
+    if use_tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        tb = SummaryWriter(os.path.join("runs", stem))
+        print(f"TensorBoard -> runs/{stem}  (view: tensorboard --logdir runs)")
+    wb = None
+    if use_wandb:
+        try:
+            import wandb
+            wb = wandb.init(project=wandb_project, name=stem, config=run_cfg)
+            print(f"W&B -> project '{wandb_project}', run '{stem}'")
+        except Exception as e:
+            print(f"[wandb] disabled: {e}")
+
+    def log_scalars(d, step):
+        if tb is not None:
+            for k, v in d.items():
+                tb.add_scalar(k, v, step)
+        if wb is not None:
+            wb.log(d, step=step)
+
+    # --- optional periodic test inference: generate audio with the in-training head ---
+    # Enabled when test_cfg provides the base diffusion model (model_config + ckpt_path).
+    # Uses the just-saved epoch checkpoint as the LatCH guide so metadata/criterion match.
+    _base = {}
+    def run_test_inference(epoch, ckpt_path, step):
+        if not test_cfg or not test_cfg.get("model_config") or not test_cfg.get("ckpt_path"):
+            return
+        if (epoch + 1) % int(test_cfg.get("every_epochs", 1)) != 0:
+            return
+        try:
+            import json as _json, soundfile as _sf
+            from stable_audio_tools.models.factory import create_model_from_config
+            from stable_audio_tools.models.utils import load_ckpt_state_dict
+            from stable_audio_tools.inference.generation import generate_diffusion_cond
+            if "model" not in _base:
+                with open(test_cfg["model_config"]) as f:
+                    mc = _json.load(f)
+                bm = create_model_from_config(mc)
+                bm.load_state_dict(load_ckpt_state_dict(test_cfg["ckpt_path"]))
+                _base.update(model=bm.half().to(device).eval(),
+                             sr=mc["sample_rate"], ss=mc["sample_size"])
+                print(f"  [test inference: base model loaded from {test_cfg['ckpt_path']}]")
+            bm, sr, ss = _base["model"], _base["sr"], _base["ss"]
+            win = test_cfg.get("window", [0.5, 1.0])
+            n_steps = int(test_cfg.get("steps", 50))
+            # target_value may be a scalar OR a bracket list -> one clip per value
+            tv = test_cfg.get("target_value", feature_stats.get("max", 1.0))
+            values = tv if isinstance(tv, (list, tuple)) else [tv]
+            audio_logs = {}
+            for val in values:
+                audio = generate_diffusion_cond(
+                    bm, steps=n_steps, cfg_scale=float(test_cfg.get("cfg_scale", 7.0)),
+                    conditioning=[{"prompt": test_cfg.get("prompt", ""),
+                                   "seconds_total": round(ss / sr)}],
+                    sample_size=ss, seed=int(test_cfg.get("seed", 42)),
+                    device=device, sigma_max=1.0,
+                    latch_configs=[{
+                        "model_path": ckpt_path,
+                        "kind": test_cfg.get("kind", target_kind_default),
+                        "value": float(val),
+                        "weight": float(test_cfg.get("weight", 1.0)),
+                        "start_pct": float(win[0]), "end_pct": float(win[1]),
+                    }],
+                    latch_hparams={
+                        "rho": float(test_cfg.get("rho", test_cfg.get("gain", 5.0))),
+                        "mu": float(test_cfg.get("mu", test_cfg.get("gain", 5.0))),
+                        "gamma": float(test_cfg.get("gamma", 0.3)),
+                        "n_iter": int(test_cfg.get("n_iter", 4)),
+                        "log_norms": False,
+                    },
+                )
+                wav = audio.squeeze(0).cpu().float().numpy()  # [C, N]
+                vtag = f"{float(val):g}".replace("-", "m").replace(".", "p")
+                out_wav = os.path.join(save_dir, f"{stem}_test_ep{epoch+1}_tgt{vtag}.wav")
+                _sf.write(out_wav, wav.T, sr)
+                print(f"  ↳ test inference ({n_steps} steps, target={val}) → {out_wav}")
+                if wb is not None:
+                    import wandb
+                    audio_logs[f"test/audio_tgt{vtag}"] = wandb.Audio(
+                        wav.mean(0), sample_rate=sr, caption=f"ep{epoch+1} target={val}")
+            if wb is not None and audio_logs:
+                import wandb  # noqa: F401
+                wb.log(audio_logs, step=step)
+        except Exception as e:
+            print(f"  [test inference skipped: {e}]")
+
+    global_step = 0
     scaler = torch.cuda.amp.GradScaler()
-    
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -239,12 +375,17 @@ def train(
             scaler.update()
             
             total_loss += loss.item()
+            global_step += 1
             pbar.set_postfix({'loss': loss.item()})
+            if (tb is not None or wb is not None) and global_step % 50 == 0:
+                log_scalars({"train/loss_step": loss.item()}, global_step)
             
         avg_loss = total_loss / len(loader)
         val_mean, val_median = validate()
         print(f"Epoch {epoch+1}: train_avg={avg_loss:.4f}  "
               f"val_mean={val_mean:.4f}  val_median={val_median:.4f}")
+        log_scalars({"train/avg": avg_loss, "val/mean": val_mean,
+                     "val/median": val_median, "epoch": epoch + 1}, global_step)
 
         checkpoint = {
             "state_dict": model.state_dict(),
@@ -258,54 +399,79 @@ def train(
             "val_mean": val_mean,
             "val_median": val_median,
         }
-        torch.save(checkpoint, os.path.join(save_dir, f"latch_{target_feature}_ep{epoch+1}.pt"))
+        ep_ckpt = os.path.join(save_dir, f"{stem}_ep{epoch+1}.pt")
+        torch.save(checkpoint, ep_ckpt)
 
         # Keep a best-by-val-median copy (the outlier-robust convergence signal)
         if val_median == val_median and val_median < best_val_median:  # not NaN and improved
             best_val_median = val_median
-            torch.save(checkpoint, os.path.join(save_dir, f"latch_{target_feature}_best.pt"))
-            print(f"  ↳ new best (val_median={val_median:.4f}) → latch_{target_feature}_best.pt")
+            torch.save(checkpoint, os.path.join(save_dir, f"{stem}_best.pt"))
+            print(f"  ↳ new best (val_median={val_median:.4f}) → {stem}_best.pt")
+            log_scalars({"best/val_median": best_val_median}, global_step)
+
+        run_test_inference(epoch, ep_ckpt, global_step)
+
+    if tb is not None:
+        tb.close()
+    if wb is not None:
+        wb.finish()
 
 if __name__ == "__main__":
     import argparse
+    import yaml
     parser = argparse.ArgumentParser(
-        description="Train a LatCH head on a time-series MIR feature."
+        description="Train a LatCH head. Settings can come from a --config YAML; "
+                    "explicit CLI flags override the YAML."
     )
-    parser.add_argument(
-        "--feature", type=str, default="rms_energy_bass",
-        help=("Target feature name (bare, without _ts suffix). "
-              "Examples: spectral_flatness, rms_energy_bass, beat_activations, hpcp, tonic")
-    )
-    parser.add_argument("--epochs",     type=int,   default=10)
-    parser.add_argument("--batch-size", type=int,   default=8)
-    parser.add_argument("--lr",         type=float, default=1e-4)
-    parser.add_argument(
-        "--latent-dir", type=str, default="/run/media/kim/Lehto/latents",
-        help="Root directory of per-track .npy latent files"
-    )
-    parser.add_argument(
-        "--db-path", type=str, default=None,
-        help="Override path to timeseries.db (default: /home/kim/Projects/mir/data/timeseries.db)"
-    )
-    parser.add_argument("--save-dir", type=str, default="latch_weights")
-    parser.add_argument("--val-frac", type=float, default=0.02,
-                        help="fraction held out for validation (deterministic split)")
-    parser.add_argument(
-        "--objective", type=str, default="rectified_flow",
-        choices=["rectified_flow", "rf_denoiser", "v"],
-        help=("Forward-noising schedule; MUST match the diffusion model this head "
-              "will guide. Small base model = rectified_flow.")
-    )
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML with training + test-inference settings (see latch_train.yaml). "
+                             "CLI flags override matching YAML keys.")
+    # Overridable settings default to None so we can tell whether the user set them
+    # on the CLI (CLI wins) vs. falling back to the YAML, then to the built-in default.
+    parser.add_argument("--feature", type=str, default=None,
+                        help="bare feature name, e.g. rms_energy_bass, spectral_flatness, hpcp")
+    parser.add_argument("--epochs",     type=int,   default=None)
+    parser.add_argument("--batch-size", type=int,   default=None)
+    parser.add_argument("--lr",         type=float, default=None)
+    parser.add_argument("--latent-dir", type=str,   default=None)
+    parser.add_argument("--db-path",    type=str,   default=None)
+    parser.add_argument("--save-dir",   type=str,   default=None)
+    parser.add_argument("--val-frac",   type=float, default=None)
+    parser.add_argument("--num-workers", type=int,  default=None)
+    parser.add_argument("--tag",        type=str,   default=None,
+                        help="version label in the checkpoint filename, e.g. v2")
+    parser.add_argument("--objective",  type=str,   default=None,
+                        choices=["rectified_flow", "rf_denoiser", "v"],
+                        help="forward-noising schedule; MUST match the diffusion model "
+                             "(Small = rectified_flow)")
+    parser.add_argument("--tensorboard", action="store_true")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default=None)
     args = parser.parse_args()
 
+    ycfg = {}
+    if args.config:
+        with open(args.config) as f:
+            ycfg = yaml.safe_load(f) or {}
+        print(f"Loaded config from {args.config}")
+
+    def pick(cli, key, default):
+        return cli if cli is not None else ycfg.get(key, default)
+
     train(
-        latent_dir=args.latent_dir,
-        target_feature=args.feature,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        db_path=args.db_path,
-        save_dir=args.save_dir,
-        objective=args.objective,
-        val_frac=args.val_frac,
+        latent_dir=pick(args.latent_dir, "latent_dir", "/run/media/kim/Lehto/latents"),
+        target_feature=pick(args.feature, "feature", "rms_energy_bass"),
+        epochs=pick(args.epochs, "epochs", 10),
+        batch_size=pick(args.batch_size, "batch_size", 8),
+        lr=pick(args.lr, "lr", 1e-4),
+        db_path=pick(args.db_path, "db_path", None),
+        save_dir=pick(args.save_dir, "save_dir", "latch_weights"),
+        objective=pick(args.objective, "objective", "rectified_flow"),
+        val_frac=pick(args.val_frac, "val_frac", 0.02),
+        tag=pick(args.tag, "tag", ""),
+        num_workers=pick(args.num_workers, "num_workers", 4),
+        use_tensorboard=args.tensorboard or bool(ycfg.get("tensorboard", False)),
+        use_wandb=args.wandb or bool(ycfg.get("wandb", False)),
+        wandb_project=pick(args.wandb_project, "wandb_project", "latch"),
+        test_cfg=ycfg.get("test"),
     )
