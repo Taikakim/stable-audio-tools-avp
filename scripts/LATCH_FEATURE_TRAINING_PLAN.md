@@ -39,7 +39,7 @@ W&B/test-inference via `latch_train.yaml`.
 | rms_energy_body | smooth_l1 | ramp_up | [−60,0] | [−55, −7] | **linear** (dB is already log) | 1 | same recipe as bass |
 | rms_energy_mid | smooth_l1 | ramp_up | [−60,0] | [−55, −8] | linear | 1 | |
 | rms_energy_air | smooth_l1 | ramp_up | [−60,0] | [−60, −10] | linear | 1 | |
-| tonic_strength | smooth_l1 | constant | [0,1] | [0.3, 1.0] | linear | 1 | how key-defined |
+| tonic_strength | smooth_l1 | constant | [0,1] | [0.3, 1.0] | linear | ~~1~~ **skip** | **DEAD-for-guidance (verified)** — see below |
 | spectral_flatness | smooth_l1 | constant | floor 1e-3 | [0.001, 0.7] | **LOG** | 2 | tonal↔noisy, ~100× spread |
 | spectral_flux | smooth_l1 | ramp_up | clip≈290 | [0, 200] | linear | 2 | transient/spectral motion |
 | spectral_skewness | smooth_l1 | constant | none | [−1, 8] | linear (signed → can't log) | 2 | |
@@ -49,6 +49,14 @@ W&B/test-inference via `latch_train.yaml`.
 | onsets_activations | bce_logits | beat_grid | — | BPM [60, 200] | linear | 3 | |
 | hpcp | cosine | — | — | per-pitch-class / key selector | n/a (vector) | 4 | **needs vector-target UI** |
 | tonic | smooth_l1 | constant | — | [0, 11] | linear (circular!) | 4 | ill-posed under MSE — weak |
+
+> **Finding (2026-05-26): `tonic_strength` is dead-for-guidance.** It trained and
+> converged, but the head predicts ≈the dataset mean for every clip (pred_std ≈ 0.05)
+> and its input sensitivity `‖∂pred/∂z‖/‖z‖ ≈ 0.015` — ~100× lower than the rms
+> heads (~1.5). The feature is low-variance / weakly encoded in the latent, so
+> guidance has ~nothing to push (no gain/weight helps). `tonic` will be the same.
+> **Skip both.** Screen any new head first with `scripts/latch_head_sensitivity.py`;
+> a tiny pred_std / sensitivity means it won't guide. For harmony, use `hpcp`.
 
 ## Cross-cutting changes needed (before/with the harder features)
 
