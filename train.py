@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use('Agg')  # headless backend to avoid segfault on ROCm
+import stable_audio_tools.rocm_env  # set HIP/MIOpen/TunableOp env before torch
 import torch
 import json
 import os
@@ -9,6 +12,16 @@ from stable_audio_tools.data.dataset import create_dataloader_from_config, fast_
 from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict, remove_weight_norm_from_model
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
+
+# Monkey-patch: matplotlib's spectrogram rendering segfaults on ROCm/headless
+# Replace with a no-op that returns a blank PIL image
+from PIL import Image as _PILImage
+import stable_audio_tools.interface.aeiou as _aeiou
+import stable_audio_tools.training.diffusion as _diffusion_training
+def _noop_spectrogram(*args, **kwargs):
+    return _PILImage.new('RGBA', (1, 1), (0, 0, 0, 0))
+_aeiou.audio_spectrogram_image = _noop_spectrogram
+_diffusion_training.audio_spectrogram_image = _noop_spectrogram
 
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
