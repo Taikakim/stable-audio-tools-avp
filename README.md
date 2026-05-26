@@ -1,4 +1,4 @@
-# stable-audio-tools-AVP 
+# audio-tools-AVP (fork of stable-audio-tools)
 
 > **Fork by [aavepyora.online](https://aavepyora.online).** A personal fork of Stability AI's `stable-audio-tools` that adds **LatCH (Latent-Control Heads)** — fine-grained, training-free guidance of generation (bass energy, spectral texture, rhythm, key, …).
 
