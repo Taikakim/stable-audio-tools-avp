@@ -158,6 +158,11 @@ def train(
     use_wandb=False,
     wandb_project="latch",
     test_cfg=None,
+    standardize=False,
+    smooth_kind="none",
+    smooth_width=0.0,
+    subset_frac=1.0,
+    subset_seed=0,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
@@ -179,6 +184,8 @@ def train(
         target_feature=target_feature,
         db_path=db_path,
         clamp_min=clamp_min, clamp_max=clamp_max,
+        smooth_kind=smooth_kind, smooth_width=smooth_width,
+        subset_frac=subset_frac, subset_seed=subset_seed,
     )
     if len(dataset) == 0:
         print("No valid latent-INFO pairs found. Make sure external drives are mounted.")
@@ -201,6 +208,12 @@ def train(
     feature_stats = _sample_target_stats(train_ds, n=200)
     print(f"Target stats: {feature_stats}")
     target_kind_default = _default_kind_for(dataset.bare_feature)
+    smoothing_on = smooth_kind not in (None, "none") and smooth_width > 0
+    if smoothing_on:
+        # A smoothed marker train is a continuous density envelope, not a beat grid.
+        target_kind_default = "constant"
+        print(f"Smoothing: kind={smooth_kind}, width={smooth_width} → continuous density "
+              f"(regression target, kind=constant)")
     print(f"Default target kind for inference: {target_kind_default}")
     slider = _slider_spec(feature_stats, clamp=(clamp_min, clamp_max))  # UI bounds + linear/log scale
     print(f"Slider spec: {slider}")
@@ -225,7 +238,7 @@ def train(
             return (1.0 - (p_norm * t_norm).sum(dim=1)).mean()
         criterion = cosine_loss
         loss_type = "cosine"
-    elif "beat" in bare or "onset" in bare:
+    elif ("beat" in bare or "onset" in bare) and not smoothing_on:
         def sparse_weighted_bce(preds, targets, threshold=0.2):
             loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
             mask = targets > threshold
@@ -235,16 +248,28 @@ def train(
         criterion = sparse_weighted_bce
         loss_type = "bce_logits"  # head emits logits; inference guidance must match
     else:
-        # Robust regression loss (Huber/SmoothL1): quadratic for small errors, linear
-        # beyond beta, so outliers (e.g. clamped silent crops) don't dominate. beta is
-        # auto-scaled to the feature (half its std) so it's in the right units.
+        # Robust regression loss (Huber/SmoothL1). Optionally standardize the target to
+        # zero-mean/unit-std so low-variance features (flatness, tonic_strength, …) can't
+        # collapse to predicting the mean; un-standardized at inference via metadata.
         std = float(feature_stats.get("std") or 1.0)
-        huber_beta = max(1e-3, round(0.5 * std, 4))
+        if standardize:
+            std_mean = float(feature_stats.get("mean") or 0.0)
+            std_std = max(std, 1e-6)
+            huber_beta = 1.0  # standardized units
+            print(f"Standardized targets: (x-{std_mean:.4f})/{std_std:.4f}; SmoothL1 beta=1.0")
+        else:
+            huber_beta = max(1e-3, round(0.5 * std, 4))
+            print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
         criterion = nn.SmoothL1Loss(beta=huber_beta)
         loss_type = "smooth_l1"
-        print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
 
     huber_beta = locals().get("huber_beta")  # None unless regression branch set it
+    std_mean = locals().get("std_mean")      # None unless standardize (regression only)
+    std_std = locals().get("std_std")
+
+    def _std_t(tgt):
+        """Standardize a target tensor (identity unless --standardize on a regression head)."""
+        return tgt if std_mean is None else (tgt - std_mean) / std_std
 
     def validate():
         """Held-out loss with FIXED noise/timesteps so it's comparable across epochs."""
@@ -260,7 +285,7 @@ def train(
                 z = a.view(Bv, 1, 1) * v_lat + s.view(Bv, 1, 1) * torch.randn(
                     v_lat.shape, device=device, generator=vg)
                 with torch.cuda.amp.autocast():
-                    losses.append(criterion(model(z, tv), v_tgt).item())
+                    losses.append(criterion(model(z, tv), _std_t(v_tgt)).item())
         model.train()
         if not losses:
             return float("nan"), float("nan")
@@ -276,6 +301,7 @@ def train(
         "huber_beta": huber_beta, "target_clamp": [clamp_min, clamp_max],
         "lr": lr, "batch_size": batch_size, "epochs": epochs, "val_frac": val_frac,
         "out_channels": out_channels, "tag": tag,
+        "smooth_kind": smooth_kind, "smooth_width": smooth_width, "subset_frac": subset_frac,
         **{f"stat_{k}": v for k, v in feature_stats.items()},
     }
     tb = None
@@ -401,7 +427,7 @@ def train(
             with torch.cuda.amp.autocast():
                 # Predict controls directly from noisy latent `z_t`
                 preds = model(z_t, t)
-                loss = criterion(preds, targets)
+                loss = criterion(preds, _std_t(targets))
                 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -429,6 +455,12 @@ def train(
             "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine
             "huber_beta": huber_beta,     # SmoothL1 beta (None unless loss_type==smooth_l1)
             "target_clamp": [clamp_min, clamp_max],
+            "standardized": std_mean is not None,  # head predicts (x-mean)/std space
+            "std_mean": std_mean,         # un-standardize at inference: x = pred*std + mean
+            "std_std": std_std,
+            "smooth_kind": smooth_kind,   # envelope smoothing applied to the marker target
+            "smooth_width": smooth_width,
+            "subset_frac": subset_frac,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
@@ -481,6 +513,19 @@ if __name__ == "__main__":
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--standardize", action="store_true",
+                        help="train regression heads on zero-mean/unit-std targets "
+                             "(helps low-variance features avoid mean-collapse)")
+    parser.add_argument("--smooth-kind", type=str, default=None,
+                        choices=["none", "gaussian", "linear", "lowpass", "beat_weighted"],
+                        help="smooth a sparse marker feature (beat/onset) into a continuous "
+                             "density envelope; routes it to a regression loss")
+    parser.add_argument("--smooth-width", type=float, default=None,
+                        help="smoothing width in latent frames (~46 ms each), e.g. 3")
+    parser.add_argument("--subset-frac", type=float, default=None,
+                        help="deterministically train on a fraction of the data (e.g. 0.3) — "
+                             "for quick smoothing-kind bake-offs; seeded so it's reproducible")
+    parser.add_argument("--subset-seed", type=int, default=None)
     args = parser.parse_args()
 
     ycfg = {}
@@ -505,7 +550,12 @@ if __name__ == "__main__":
         tag=pick(args.tag, "tag", ""),
         num_workers=pick(args.num_workers, "num_workers", 4),
         use_tensorboard=args.tensorboard or bool(ycfg.get("tensorboard", False)),
+        standardize=args.standardize or bool(ycfg.get("standardize", False)),
         use_wandb=args.wandb or bool(ycfg.get("wandb", False)),
         wandb_project=pick(args.wandb_project, "wandb_project", "latch"),
         test_cfg=ycfg.get("test"),
+        smooth_kind=pick(args.smooth_kind, "smooth_kind", "none"),
+        smooth_width=pick(args.smooth_width, "smooth_width", 0.0),
+        subset_frac=pick(args.subset_frac, "subset_frac", 1.0),
+        subset_seed=pick(args.subset_seed, "subset_seed", 0),
     )

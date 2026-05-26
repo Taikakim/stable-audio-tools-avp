@@ -98,6 +98,57 @@ def _prepare_target(arr: np.ndarray, max_frames: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Continuous-envelope smoothing — turns a sparse marker train (beat/onset) into a
+# dense, continuous "density" target. Sparse spikes are nearly undecodable from the
+# latent (linear probe R^2~0.03 for raw beats); smoothing makes them decodable and
+# gives guidance a non-flat gradient. width is in LATENT FRAMES (~46 ms each).
+# ---------------------------------------------------------------------------
+
+def _smooth_kernel(kind: str, width: float):
+    if width <= 0:
+        return None
+    if kind == "gaussian":
+        r = int(np.ceil(3 * width))
+        x = np.arange(-r, r + 1)
+        k = np.exp(-(x ** 2) / (2 * width ** 2))
+    elif kind in ("linear", "triangular"):
+        r = max(1, int(round(width)))
+        x = np.arange(-r, r + 1)
+        k = np.clip(1.0 - np.abs(x) / (r + 1), 0.0, None)
+    elif kind in ("lowpass", "boxcar"):
+        L = max(1, int(round(2 * width + 1)))
+        k = np.ones(L, dtype=np.float64)
+    else:
+        return None
+    return (k / k.sum()).astype(np.float32)
+
+
+def smooth_envelope(arr: np.ndarray, kind: str, width: float,
+                    beat: Optional[np.ndarray] = None, beat_boost: float = 2.0) -> np.ndarray:
+    """Smooth a marker envelope (C, T) into a continuous one.
+
+    kinds: gaussian | linear (triangular) | lowpass (boxcar) | beat_weighted.
+    `beat_weighted` scales each onset by its proximity to the (smoothed, normalised)
+    beat grid `beat` [T] before a gaussian smooth, so metric-strong (on-beat) onsets
+    dominate — a "pulse clarity / groove strength" target rather than plain density.
+    """
+    if kind in (None, "none") or width <= 0:
+        return arr
+    if kind == "beat_weighted":
+        gk = _smooth_kernel("gaussian", width)
+        a = arr.astype(np.float32)
+        if beat is not None:
+            be = np.convolve(np.asarray(beat, np.float32).reshape(-1), gk, mode="same")
+            be = be / (be.max() + 1e-8)
+            a = a * (1.0 + beat_boost * be[None, :])
+        return np.stack([np.convolve(a[c], gk, mode="same") for c in range(a.shape[0])]).astype(np.float32)
+    k = _smooth_kernel(kind, width)
+    if k is None:
+        return arr
+    return np.stack([np.convolve(arr[c], k, mode="same") for c in range(arr.shape[0])]).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -130,6 +181,10 @@ class LatCHDataset(Dataset):
         stem_suffixes=None,
         clamp_min: Optional[float] = None,
         clamp_max: Optional[float] = None,
+        smooth_kind: str = "none",
+        smooth_width: float = 0.0,
+        subset_frac: float = 1.0,
+        subset_seed: int = 0,
     ):
         self.latent_dir      = Path(latent_dir)
         self.info_dir        = Path(info_dir) if info_dir else None
@@ -138,6 +193,11 @@ class LatCHDataset(Dataset):
         # outliers). Applied to every returned target; keep train & inference consistent.
         self.clamp_min       = clamp_min
         self.clamp_max       = clamp_max
+        # Continuous-envelope smoothing (for sparse marker features) + deterministic subset
+        self.smooth_kind     = smooth_kind
+        self.smooth_width    = float(smooth_width)
+        self.subset_frac     = float(subset_frac)
+        self.subset_seed     = int(subset_seed)
 
         # Canonical name is bare (no _ts).  We always append _ts for DB lookups.
         self.bare_feature    = target_feature.removesuffix("_ts")
@@ -176,6 +236,14 @@ class LatCHDataset(Dataset):
                     self.items.append((npy_path, crop_key))
 
         print(f"Found {len(self.items)} latent files.")
+
+        # Deterministic subset (seeded) — for quick smoothing-kind bake-offs on a fraction.
+        if self.subset_frac < 1.0 and self.items:
+            rng = np.random.RandomState(self.subset_seed)
+            keep = max(1, int(round(self.subset_frac * len(self.items))))
+            sel = sorted(rng.permutation(len(self.items))[:keep].tolist())
+            self.items = [self.items[i] for i in sel]
+            print(f"Subset: kept {len(self.items)} items (frac={self.subset_frac}, seed={self.subset_seed})")
 
         # Validate a sample to fail fast with a helpful message
         if self.items and self.is_ts_feature and self._db is not None:
@@ -229,6 +297,14 @@ class LatCHDataset(Dataset):
                             f"'{self.ts_feature}' missing in TimeseriesDB for key '{crop_key}'"
                         )
                     target = _prepare_target(raw, self.max_frames)  # (C, max_frames)
+                    if self.smooth_kind not in (None, "none") and self.smooth_width > 0:
+                        beat = None
+                        if self.smooth_kind == "beat_weighted":
+                            braw = _load_ts_from_db(self._db, crop_key, "beat_activations_ts")
+                            if braw is not None:
+                                beat = _prepare_target(braw, self.max_frames)[0]  # [T]
+                        target = smooth_envelope(target, self.smooth_kind,
+                                                 self.smooth_width, beat=beat)
 
                 else:
                     # --- scalar: broadcast to [1, max_frames] ---

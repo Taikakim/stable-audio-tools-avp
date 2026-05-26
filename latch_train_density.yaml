@@ -1,0 +1,77 @@
+# LatCH rhythmic-DENSITY bake-off config.
+#
+# Trains a CONTINUOUS density head from a sparse marker feature (onsets/beats) by
+# smoothing the marker train into an envelope (see scripts/latch_dataset.py).
+# Smoothing routes the feature to a regression loss (SmoothL1) instead of BCE, and
+# `--standardize` puts every kind in unit-variance space so their val losses are
+# directly COMPARABLE — that's how we pick the best smoothing.
+#
+# Bake-off: 4 epochs on 30% of the data (seeded, deterministic), one run per kind.
+# Compare the printed `val_median` (lower = the latent explains more of that target):
+#
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind gaussian      --tag dens_gauss3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind linear        --tag dens_lin3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind lowpass       --tag dens_lp3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind beat_weighted --tag dens_beatw3
+#
+# Then retrain the winner full-data / 30 epochs (drop subset_frac, bump epochs, new --tag).
+
+feature: onsets_activations     # dense markers smooth best (probe: raw 0.10 -> gaussian 0.34)
+objective: rectified_flow
+standardize: true               # REQUIRED for a fair cross-kind comparison
+smooth_kind: gaussian           # overridden per run with --smooth-kind
+smooth_width: 3.0               # ~140 ms; the probe sweet spot
+subset_frac: 0.3                # quick bake-off on a deterministic 30% subset
+subset_seed: 0
+
+epochs: 4
+lr: 3.0e-4
+batch_size: 64
+num_workers: 10
+val_frac: 0.05                  # a touch larger so val_median is stable on the subset
+tag: dens_gauss3                # overridden per run with --tag
+save_dir: latch_weights
+latent_dir: /run/media/kim/Lehto/latents
+
+amd:
+  PYTORCH_TUNABLEOP_ENABLED: "1"
+  PYTORCH_TUNABLEOP_TUNING: "1"
+  PYTORCH_TUNABLEOP_VERBOSE: "1"
+  PYTORCH_TUNABLEOP_FILENAME: /home/kim/pytorch-tunings-7.2.2/tunableop_results.csv
+  PYTORCH_SDP_KERNEL_VERBOSE: "1"
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.6,max_split_size_mb:512
+  PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
+  HIP_FORCE_DEV_KERNARG: "1"
+  MIOPEN_FIND_MODE: "6"
+  MIOPEN_CUSTOM_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/miopen/cache
+  MIOPEN_USER_DB_PATH: /home/kim/pytorch-tunings-7.2.2/miopen/db
+  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+  TRITON_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/triton_cache
+  OMP_NUM_THREADS: "8"
+
+wandb: true
+wandb_project: latch
+tensorboard: false
+
+# Optional listen at the final epoch: low vs high density, same seed (kind=constant
+# because a density head sets a LEVEL, not a beat grid). Values are raw smoothed-
+# envelope units; guidance standardizes internally. A/B the extremes by ear.
+test:
+  model_config: models/checkpoints/small/base_model_config.json
+  ckpt_path:    models/checkpoints/small/base_model.ckpt
+  every_epochs: 4
+  steps: 20
+  prompt: "techno groove, drums and percussion, snappy kick, hats"
+  seed: 42
+  cfg_scale: 3.0
+  kind: constant
+  target_value: [0.05, 0.5]
+  window: [0.4, 1.0]
+  gain: 8.0
+  gamma: 0.3
+  n_iter: 6
+  weight: 10.0
