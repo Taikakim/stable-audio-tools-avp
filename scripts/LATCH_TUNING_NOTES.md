@@ -20,10 +20,14 @@ Small (rectified-flow) model. Read this before training a new feature or chasing
   outlier-skewed. Keep the **best-by-val-median** checkpoint.
 - **Heads converge fast (~10 epochs) then overfit.** 30 epochs is ample;
   best-by-val selects the right one regardless. No need for 40 on these.
-- **Standardize low-variance targets.** Features with small spread (flatness,
-  tonic_strength) tend to collapse to predicting the mean under uniform-`t`
-  noising. Training on zero-mean/unit-std targets (`--standardize`) is the fix
-  (un-standardized at inference via metadata).
+- **Standardize regression targets — CONFIRMED fix, recommend by default.**
+  A small-scale feature's head outputs at the feature's tiny scale (flatness ~0.1)
+  → its guidance gradient is negligible → "dead." Training/guiding in zero-mean/
+  unit-std space (`--standardize`; un-standardized at inference via metadata) gives
+  a usable gradient scale. **Verified: flatness sensitivity 0.10 → 0.42 (WEAK→OK).**
+  Bonus: standardizing *all* regression heads makes the guidance scale **uniform
+  across features**, so the same ρ/μ/weight work everywhere (no per-feature
+  retuning). Recommendation: standardize by default for regression heads.
 
 ## Inference / guidance tuning
 
@@ -65,7 +69,8 @@ Small (rectified-flow) model. Read this before training a new feature or chasing
 | rms_energy_{bass,body,mid,air} | **controllable** (trained, pushed) |
 | spectral_flux (sens ~7.8), spectral_kurtosis | **controllable** (trained, pushed) |
 | beat_activations | **controllable** (sens 0.48) |
-| spectral_flatness, tonic_strength | head **collapsed** but feature **is encoded** (probe) → standardization retrain (in test) |
+| spectral_flatness | **recovered via `--standardize`** (sens 0.10→0.42) — was a scale/collapse issue, not missing signal |
+| tonic_strength | collapsed at raw scale; feature only moderately encoded (probe R²~0.34) — retry standardized |
 | spectral_skewness | weak (sens ~0.19) |
 | tonic, atonality, reverberation | only moderately encoded (probe R²~0.3) |
 | (probe) lufs/warmth/sharpness/brightness, hpcp_*, tiv_*, bpm/syncopation | strongly encoded — good future candidates |
