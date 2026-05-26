@@ -1,6 +1,14 @@
 # stable-audio-tools
 
-> **Fork by [aavepyora.online](https://aavepyora.online).** A personal fork of Stability AI's `stable-audio-tools` that adds **LatCH (Latent-Control Heads)** — fine-grained, training-free control of generation (bass energy, spectral texture, rhythm, key, …). The LatCH trainer and guidance were implemented from Stability AI's research paper *Low-Resource Guidance for Controllable Latent Audio Diffusion* (arXiv:2603.04366). See [`scripts/LATCH_README.md`](scripts/LATCH_README.md).
+> **Fork by [aavepyora.online](https://aavepyora.online).** A personal fork of Stability AI's `stable-audio-tools` that adds **LatCH (Latent-Control Heads)** — fine-grained, training-free guidance of generation (bass energy, spectral texture, rhythm, key, …).
+
+## Attribution
+
+**LatCH (Latent-Control Heads)** is the research of **Zachary Novack, Zack Zukowski, CJ Carr, Julian Parker, Zach Evans, Josiah Taylor, Taylor Berg-Kirkpatrick, Julian McAuley, and Jordi Pons** (UC San Diego & Stability AI), from the paper *"Low-Resource Guidance for Controllable Latent Audio Diffusion."*
+
+**Official project page: <https://zacharynovack.github.io/latch/latch.html>** — please refer to it for the paper, citation, and any official code release.
+
+The trainer and guidance in this fork are an **independent, community re-implementation** of the method described in that paper (written with Claude, Anthropic). This fork is **not affiliated with, nor endorsed by, the LatCH authors**. Please cite the original work, and treat the authors' own release as the canonical source if/when it is published. See [`scripts/LATCH_README.md`](scripts/LATCH_README.md) for the implementation notes.
 
 Training and inference code for audio generation models
 
