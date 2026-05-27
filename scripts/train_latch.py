@@ -158,6 +158,22 @@ def train(
     use_wandb=False,
     wandb_project="latch",
     test_cfg=None,
+    standardize=False,
+    smooth_kind="none",
+    smooth_width=0.0,
+    subset_frac=1.0,
+    subset_seed=0,
+    holdout_frac=0.0,
+    holdout_seed=12345,
+    target_source="db",
+    npz_root=None,
+    preload="none",
+    dim=256,
+    depth=6,
+    num_heads=8,
+    optimizer_name="adamw",
+    scheduler="none",
+    save_best_only=False,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
@@ -179,6 +195,10 @@ def train(
         target_feature=target_feature,
         db_path=db_path,
         clamp_min=clamp_min, clamp_max=clamp_max,
+        smooth_kind=smooth_kind, smooth_width=smooth_width,
+        subset_frac=subset_frac, subset_seed=subset_seed,
+        holdout_frac=holdout_frac, holdout_seed=holdout_seed,
+        target_source=target_source, npz_root=npz_root,
     )
     if len(dataset) == 0:
         print("No valid latent-INFO pairs found. Make sure external drives are mounted.")
@@ -189,18 +209,35 @@ def train(
     out_channels = sample_target.shape[0]  # (C, T) → C
     print(f"Target '{target_feature}': out_channels={out_channels}, seq_len={sample_target.shape[1]}")
 
-    # Deterministic train/val split (seeded so val never leaks into train across runs)
-    n_val = max(1, int(val_frac * len(dataset)))
-    n_train = len(dataset) - n_val
-    split_gen = torch.Generator().manual_seed(val_seed)
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=split_gen)
-    print(f"Split: {n_train} train / {n_val} val (val_frac={val_frac})")
+    # Train/val split. With a shared holdout (holdout_frac>0) the val set is a FIXED
+    # subset of the full population (identical across subset/full runs) — so val_median
+    # is directly comparable for ablations. Otherwise: the usual seeded random split.
+    if getattr(dataset, "holdout_indices", None):
+        from torch.utils.data import Subset
+        train_ds = Subset(dataset, dataset.train_indices)
+        val_ds = Subset(dataset, dataset.holdout_indices)
+        n_train, n_val = len(train_ds), len(val_ds)
+        print(f"Shared-holdout split: {len(train_ds)} train / {len(val_ds)} val "
+              f"(holdout_frac={holdout_frac}, seed={holdout_seed}, subset_frac={subset_frac}) "
+              f"— val is identical across runs, comparable for ablation")
+    else:
+        n_val = max(1, int(val_frac * len(dataset)))
+        n_train = len(dataset) - n_val
+        split_gen = torch.Generator().manual_seed(val_seed)
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=split_gen)
+        print(f"Split: {n_train} train / {n_val} val (val_frac={val_frac})")
 
     # Compute target stats from the TRAIN split only (don't peek at val)
     print("Sampling target stats from train split (up to 200 items)...")
     feature_stats = _sample_target_stats(train_ds, n=200)
     print(f"Target stats: {feature_stats}")
     target_kind_default = _default_kind_for(dataset.bare_feature)
+    smoothing_on = smooth_kind not in (None, "none") and smooth_width > 0
+    if smoothing_on:
+        # A smoothed marker train is a continuous density envelope, not a beat grid.
+        target_kind_default = "constant"
+        print(f"Smoothing: kind={smooth_kind}, width={smooth_width} → continuous density "
+              f"(regression target, kind=constant)")
     print(f"Default target kind for inference: {target_kind_default}")
     slider = _slider_spec(feature_stats, clamp=(clamp_min, clamp_max))  # UI bounds + linear/log scale
     print(f"Slider spec: {slider}")
@@ -211,10 +248,65 @@ def train(
                             num_workers=max(1, num_workers // 2), persistent_workers=num_workers > 0)
     print(f"DataLoader workers: {num_workers} (train) / {max(1, num_workers // 2)} (val)")
 
+    # --- optional one-time preload: materialize (latent, target) into a contiguous
+    # tensor so every epoch is GPU-bound (no per-step DB decompress / external-drive
+    # reads). `gpu` keeps it in VRAM (fastest; subset must fit); `ram` keeps it in
+    # host RAM and streams batches. Pays a single read+decompress pass up front.
+    def _preload_tensors(subset, where, tag):
+        dl = DataLoader(subset, batch_size=512, shuffle=False,
+                        num_workers=num_workers, persistent_workers=False)
+        lats, tgts = [], []
+        for lat, tgt in tqdm(dl, desc=f"preload[{tag}]"):
+            lats.append(lat); tgts.append(tgt)
+        L = torch.cat(lats, 0); T = torch.cat(tgts, 0)
+        need_gb = (L.numel() + T.numel()) * 4 / 1e9
+        if where == "gpu" and torch.cuda.is_available():
+            free = torch.cuda.mem_get_info()[0]
+            if (L.numel() + T.numel()) * 4 < free * 0.7:
+                L, T = L.to(device), T.to(device)
+                print(f"preload[{tag}]: {tuple(L.shape)} on GPU ({need_gb:.2f} GB)")
+                return L, T
+            print(f"preload[{tag}]: {need_gb:.2f} GB > 70% of free VRAM "
+                  f"({free/1e9:.2f} GB) → falling back to RAM")
+        print(f"preload[{tag}]: {tuple(L.shape)} in RAM ({need_gb:.2f} GB)")
+        return L, T
+
+    pre_train = pre_val = None
+    if preload and preload != "none":
+        print(f"Preloading dataset into {preload.upper()} (one-time pass)...")
+        pre_train = _preload_tensors(train_ds, preload, "train")
+        pre_val = _preload_tensors(val_ds, preload, "val")
+
     # Init Model — out_channels adapts to the target feature shape
-    model = LatCH(in_channels=64, out_channels=out_channels, dim=256, depth=6, num_heads=8).to(device)
+    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth, num_heads=num_heads).to(device)
+    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads} "
+          f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
     
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree
+    _is_sf = optimizer_name == "schedulefree"
+    if optimizer_name == "lion":
+        from lion_pytorch import Lion
+        optimizer = Lion(model.parameters(), lr=lr, weight_decay=1e-2)
+    elif optimizer_name == "prodigy":
+        from prodigyopt import Prodigy
+        # LR-free: it adapts d; lr is a base multiplier (use 1.0) and wants a scheduler.
+        optimizer = Prodigy(model.parameters(), lr=lr, weight_decay=0.0,
+                            safeguard_warmup=True, use_bias_correction=True)
+    elif optimizer_name == "adam8bit":
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(model.parameters(), lr=lr)
+    elif optimizer_name == "schedulefree":
+        from schedulefree import AdamWScheduleFree
+        # No external LR schedule by design; needs .train()/.eval() toggling (handled below).
+        warmup = max(100, int(0.05 * epochs * max(1, n_train // batch_size)))
+        optimizer = AdamWScheduleFree(model.parameters(), lr=lr, warmup_steps=warmup)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+    sched = None
+    if scheduler == "cosine" and not _is_sf:
+        sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    print(f"Optimizer: {optimizer_name} (lr={lr}); "
+          f"scheduler: {'none (schedule-free)' if _is_sf else scheduler}")
     
     # Decide loss based on feature type (use dataset.bare_feature for matching)
     bare = dataset.bare_feature
@@ -225,7 +317,7 @@ def train(
             return (1.0 - (p_norm * t_norm).sum(dim=1)).mean()
         criterion = cosine_loss
         loss_type = "cosine"
-    elif "beat" in bare or "onset" in bare:
+    elif ("beat" in bare or "onset" in bare) and not smoothing_on:
         def sparse_weighted_bce(preds, targets, threshold=0.2):
             loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
             mask = targets > threshold
@@ -235,24 +327,46 @@ def train(
         criterion = sparse_weighted_bce
         loss_type = "bce_logits"  # head emits logits; inference guidance must match
     else:
-        # Robust regression loss (Huber/SmoothL1): quadratic for small errors, linear
-        # beyond beta, so outliers (e.g. clamped silent crops) don't dominate. beta is
-        # auto-scaled to the feature (half its std) so it's in the right units.
+        # Robust regression loss (Huber/SmoothL1). Optionally standardize the target to
+        # zero-mean/unit-std so low-variance features (flatness, tonic_strength, …) can't
+        # collapse to predicting the mean; un-standardized at inference via metadata.
         std = float(feature_stats.get("std") or 1.0)
-        huber_beta = max(1e-3, round(0.5 * std, 4))
+        if standardize:
+            std_mean = float(feature_stats.get("mean") or 0.0)
+            std_std = max(std, 1e-6)
+            huber_beta = 1.0  # standardized units
+            print(f"Standardized targets: (x-{std_mean:.4f})/{std_std:.4f}; SmoothL1 beta=1.0")
+        else:
+            huber_beta = max(1e-3, round(0.5 * std, 4))
+            print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
         criterion = nn.SmoothL1Loss(beta=huber_beta)
         loss_type = "smooth_l1"
-        print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
 
     huber_beta = locals().get("huber_beta")  # None unless regression branch set it
+    std_mean = locals().get("std_mean")      # None unless standardize (regression only)
+    std_std = locals().get("std_std")
+
+    def _std_t(tgt):
+        """Standardize a target tensor (identity unless --standardize on a regression head)."""
+        return tgt if std_mean is None else (tgt - std_mean) / std_std
 
     def validate():
         """Held-out loss with FIXED noise/timesteps so it's comparable across epochs."""
         model.eval()
+        if _is_sf:
+            optimizer.eval()    # schedule-free: switch to AVERAGED weights for val + checkpoint
+                                # (left in eval; the next epoch's optimizer.train() resumes)
         vg = torch.Generator(device=device).manual_seed(1234)
         losses = []
+        def _vbatches():
+            if pre_val is not None:
+                Lv, Tv = pre_val
+                for i in range(0, Lv.shape[0], batch_size):
+                    yield Lv[i:i + batch_size], Tv[i:i + batch_size]
+            else:
+                yield from val_loader
         with torch.no_grad():
-            for v_lat, v_tgt in val_loader:
+            for v_lat, v_tgt in _vbatches():
                 v_lat = v_lat.to(device); v_tgt = v_tgt.to(device)
                 Bv = v_lat.size(0)
                 tv = torch.rand((Bv,), device=device, generator=vg)
@@ -260,7 +374,7 @@ def train(
                 z = a.view(Bv, 1, 1) * v_lat + s.view(Bv, 1, 1) * torch.randn(
                     v_lat.shape, device=device, generator=vg)
                 with torch.cuda.amp.autocast():
-                    losses.append(criterion(model(z, tv), v_tgt).item())
+                    losses.append(criterion(model(z, tv), _std_t(v_tgt)).item())
         model.train()
         if not losses:
             return float("nan"), float("nan")
@@ -276,6 +390,10 @@ def train(
         "huber_beta": huber_beta, "target_clamp": [clamp_min, clamp_max],
         "lr": lr, "batch_size": batch_size, "epochs": epochs, "val_frac": val_frac,
         "out_channels": out_channels, "tag": tag,
+        "smooth_kind": smooth_kind, "smooth_width": smooth_width, "subset_frac": subset_frac,
+        "holdout_frac": holdout_frac, "preload": preload,
+        "dim": dim, "depth": depth, "num_heads": num_heads,
+        "optimizer": optimizer_name, "scheduler": scheduler,
         **{f"stat_{k}": v for k, v in feature_stats.items()},
     }
     tb = None
@@ -376,9 +494,23 @@ def train(
 
     for epoch in range(epochs):
         model.train()
+        if _is_sf:
+            optimizer.train()   # schedule-free: live weights for training (resumes after each eval)
         total_loss = 0.0
-        
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
+
+        if pre_train is not None:
+            Lt, Tt = pre_train
+            Nt = Lt.shape[0]
+            perm = torch.randperm(Nt, device=Lt.device)
+            n_batches = (Nt + batch_size - 1) // batch_size
+            def _train_batches():
+                for i in range(0, Nt, batch_size):
+                    b = perm[i:i + batch_size]
+                    yield Lt[b], Tt[b]
+            pbar = tqdm(_train_batches(), total=n_batches, desc=f"Epoch {epoch+1}/{epochs}")
+        else:
+            n_batches = len(loader)
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
         for latents, targets in pbar:
             latents = latents.to(device) # [B, 64, T]
             targets = targets.to(device) # [B, 1, T]
@@ -401,7 +533,7 @@ def train(
             with torch.cuda.amp.autocast():
                 # Predict controls directly from noisy latent `z_t`
                 preds = model(z_t, t)
-                loss = criterion(preds, targets)
+                loss = criterion(preds, _std_t(targets))
                 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -413,7 +545,7 @@ def train(
             if (tb is not None or wb is not None) and global_step % 50 == 0:
                 log_scalars({"train/loss_step": loss.item()}, global_step)
             
-        avg_loss = total_loss / len(loader)
+        avg_loss = total_loss / n_batches
         val_mean, val_median = validate()
         print(f"Epoch {epoch+1}: train_avg={avg_loss:.4f}  "
               f"val_mean={val_mean:.4f}  val_median={val_median:.4f}")
@@ -429,12 +561,24 @@ def train(
             "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine
             "huber_beta": huber_beta,     # SmoothL1 beta (None unless loss_type==smooth_l1)
             "target_clamp": [clamp_min, clamp_max],
+            "standardized": std_mean is not None,  # head predicts (x-mean)/std space
+            "std_mean": std_mean,         # un-standardize at inference: x = pred*std + mean
+            "std_std": std_std,
+            "smooth_kind": smooth_kind,   # envelope smoothing applied to the marker target
+            "smooth_width": smooth_width,
+            "subset_frac": subset_frac,
+            "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
+            "dim": dim, "depth": depth, "num_heads": num_heads,
+            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
         }
         ep_ckpt = os.path.join(save_dir, f"{stem}_ep{epoch+1}.pt")
-        torch.save(checkpoint, ep_ckpt)
+        if not save_best_only:            # keep only _best.pt during sweeps (disk)
+            torch.save(checkpoint, ep_ckpt)
+        if sched is not None:
+            sched.step()
 
         # Keep a best-by-val-median copy (the outlier-robust convergence signal)
         if val_median == val_median and val_median < best_val_median:  # not NaN and improved
@@ -469,6 +613,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr",         type=float, default=None)
     parser.add_argument("--latent-dir", type=str,   default=None)
     parser.add_argument("--db-path",    type=str,   default=None)
+    parser.add_argument("--target-source", type=str, default=None,
+                        choices=["db", "whole_track"],
+                        help="'db' = legacy per-crop TimeseriesDB; 'whole_track' = slice "
+                             "the crop window from a whole-track .TIMESERIES.npz (per-stem "
+                             "onset envelopes, raw madmom soft activations, etc.)")
+    parser.add_argument("--npz-root", type=str, default=None,
+                        help="Whole-track npz dir (default /run/media/kim/Lehto/timeseries)")
     parser.add_argument("--save-dir",   type=str,   default=None)
     parser.add_argument("--val-frac",   type=float, default=None)
     parser.add_argument("--num-workers", type=int,  default=None)
@@ -481,6 +632,41 @@ if __name__ == "__main__":
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--standardize", action="store_true",
+                        help="train regression heads on zero-mean/unit-std targets "
+                             "(helps low-variance features avoid mean-collapse)")
+    parser.add_argument("--smooth-kind", type=str, default=None,
+                        choices=["none", "gaussian", "linear", "lowpass", "beat_weighted"],
+                        help="smooth a sparse marker feature (beat/onset) into a continuous "
+                             "density envelope; routes it to a regression loss")
+    parser.add_argument("--smooth-width", type=float, default=None,
+                        help="smoothing width in latent frames (~46 ms each), e.g. 3")
+    parser.add_argument("--subset-frac", type=float, default=None,
+                        help="deterministically train on a fraction of the data (e.g. 0.3) — "
+                             "for quick smoothing-kind bake-offs; seeded so it's reproducible")
+    parser.add_argument("--subset-seed", type=int, default=None)
+    parser.add_argument("--holdout-frac", type=float, default=None,
+                        help="reserve a fixed holdout (e.g. 0.05) used as the val set; "
+                             "IDENTICAL across runs (separate seed), so val_median is "
+                             "comparable for subset-vs-full ablations")
+    parser.add_argument("--holdout-seed", type=int, default=None)
+    parser.add_argument("--preload", type=str, default=None,
+                        choices=["none", "ram", "gpu"],
+                        help="preload (latent,target) into RAM or VRAM once so epochs are "
+                             "GPU-bound (no per-step DB/disk). gpu requires the set to fit VRAM")
+    parser.add_argument("--dim", type=int, default=None,
+                        help="head width (256-aligned: 256/512/768/1024/1536). Bigger = more "
+                             "capacity but ~linearly slower (see latch_shape_bench.py)")
+    parser.add_argument("--depth", type=int, default=None, help="head transformer depth")
+    parser.add_argument("--num-heads", type=int, default=None, help="attention heads")
+    parser.add_argument("--optimizer", type=str, default=None,
+                        choices=["adamw", "lion", "prodigy", "adam8bit", "schedulefree"],
+                        help="adamw | lion (~3-10x lower LR) | prodigy (LR-free, lr=1.0) | "
+                             "adam8bit (bnb, low-mem) | schedulefree (no LR schedule; .train()/.eval() handled)")
+    parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
+                        help="LR schedule: none (constant) | cosine (anneal over --epochs)")
+    parser.add_argument("--save-best-only", action="store_true",
+                        help="only keep <stem>_best.pt (no per-epoch checkpoints) — for sweeps")
     args = parser.parse_args()
 
     ycfg = {}
@@ -505,7 +691,23 @@ if __name__ == "__main__":
         tag=pick(args.tag, "tag", ""),
         num_workers=pick(args.num_workers, "num_workers", 4),
         use_tensorboard=args.tensorboard or bool(ycfg.get("tensorboard", False)),
+        standardize=args.standardize or bool(ycfg.get("standardize", False)),
         use_wandb=args.wandb or bool(ycfg.get("wandb", False)),
         wandb_project=pick(args.wandb_project, "wandb_project", "latch"),
         test_cfg=ycfg.get("test"),
+        smooth_kind=pick(args.smooth_kind, "smooth_kind", "none"),
+        smooth_width=pick(args.smooth_width, "smooth_width", 0.0),
+        subset_frac=pick(args.subset_frac, "subset_frac", 1.0),
+        subset_seed=pick(args.subset_seed, "subset_seed", 0),
+        holdout_frac=pick(args.holdout_frac, "holdout_frac", 0.0),
+        holdout_seed=pick(args.holdout_seed, "holdout_seed", 12345),
+        target_source=pick(args.target_source, "target_source", "db"),
+        npz_root=pick(args.npz_root, "npz_root", None),
+        preload=pick(args.preload, "preload", "none"),
+        dim=pick(args.dim, "dim", 256),
+        depth=pick(args.depth, "depth", 6),
+        num_heads=pick(args.num_heads, "num_heads", 8),
+        optimizer_name=pick(args.optimizer, "optimizer", "adamw"),
+        scheduler=pick(args.scheduler, "scheduler", "none"),
+        save_best_only=args.save_best_only or bool(ycfg.get("save_best_only", False)),
     )
