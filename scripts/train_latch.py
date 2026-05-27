@@ -163,6 +163,12 @@ def train(
     smooth_width=0.0,
     subset_frac=1.0,
     subset_seed=0,
+    holdout_frac=0.0,
+    holdout_seed=12345,
+    preload="none",
+    dim=256,
+    depth=6,
+    num_heads=8,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
@@ -186,6 +192,7 @@ def train(
         clamp_min=clamp_min, clamp_max=clamp_max,
         smooth_kind=smooth_kind, smooth_width=smooth_width,
         subset_frac=subset_frac, subset_seed=subset_seed,
+        holdout_frac=holdout_frac, holdout_seed=holdout_seed,
     )
     if len(dataset) == 0:
         print("No valid latent-INFO pairs found. Make sure external drives are mounted.")
@@ -196,12 +203,23 @@ def train(
     out_channels = sample_target.shape[0]  # (C, T) → C
     print(f"Target '{target_feature}': out_channels={out_channels}, seq_len={sample_target.shape[1]}")
 
-    # Deterministic train/val split (seeded so val never leaks into train across runs)
-    n_val = max(1, int(val_frac * len(dataset)))
-    n_train = len(dataset) - n_val
-    split_gen = torch.Generator().manual_seed(val_seed)
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=split_gen)
-    print(f"Split: {n_train} train / {n_val} val (val_frac={val_frac})")
+    # Train/val split. With a shared holdout (holdout_frac>0) the val set is a FIXED
+    # subset of the full population (identical across subset/full runs) — so val_median
+    # is directly comparable for ablations. Otherwise: the usual seeded random split.
+    if getattr(dataset, "holdout_indices", None):
+        from torch.utils.data import Subset
+        train_ds = Subset(dataset, dataset.train_indices)
+        val_ds = Subset(dataset, dataset.holdout_indices)
+        n_train, n_val = len(train_ds), len(val_ds)
+        print(f"Shared-holdout split: {len(train_ds)} train / {len(val_ds)} val "
+              f"(holdout_frac={holdout_frac}, seed={holdout_seed}, subset_frac={subset_frac}) "
+              f"— val is identical across runs, comparable for ablation")
+    else:
+        n_val = max(1, int(val_frac * len(dataset)))
+        n_train = len(dataset) - n_val
+        split_gen = torch.Generator().manual_seed(val_seed)
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val], generator=split_gen)
+        print(f"Split: {n_train} train / {n_val} val (val_frac={val_frac})")
 
     # Compute target stats from the TRAIN split only (don't peek at val)
     print("Sampling target stats from train split (up to 200 items)...")
@@ -224,8 +242,39 @@ def train(
                             num_workers=max(1, num_workers // 2), persistent_workers=num_workers > 0)
     print(f"DataLoader workers: {num_workers} (train) / {max(1, num_workers // 2)} (val)")
 
+    # --- optional one-time preload: materialize (latent, target) into a contiguous
+    # tensor so every epoch is GPU-bound (no per-step DB decompress / external-drive
+    # reads). `gpu` keeps it in VRAM (fastest; subset must fit); `ram` keeps it in
+    # host RAM and streams batches. Pays a single read+decompress pass up front.
+    def _preload_tensors(subset, where, tag):
+        dl = DataLoader(subset, batch_size=512, shuffle=False,
+                        num_workers=num_workers, persistent_workers=False)
+        lats, tgts = [], []
+        for lat, tgt in tqdm(dl, desc=f"preload[{tag}]"):
+            lats.append(lat); tgts.append(tgt)
+        L = torch.cat(lats, 0); T = torch.cat(tgts, 0)
+        need_gb = (L.numel() + T.numel()) * 4 / 1e9
+        if where == "gpu" and torch.cuda.is_available():
+            free = torch.cuda.mem_get_info()[0]
+            if (L.numel() + T.numel()) * 4 < free * 0.7:
+                L, T = L.to(device), T.to(device)
+                print(f"preload[{tag}]: {tuple(L.shape)} on GPU ({need_gb:.2f} GB)")
+                return L, T
+            print(f"preload[{tag}]: {need_gb:.2f} GB > 70% of free VRAM "
+                  f"({free/1e9:.2f} GB) → falling back to RAM")
+        print(f"preload[{tag}]: {tuple(L.shape)} in RAM ({need_gb:.2f} GB)")
+        return L, T
+
+    pre_train = pre_val = None
+    if preload and preload != "none":
+        print(f"Preloading dataset into {preload.upper()} (one-time pass)...")
+        pre_train = _preload_tensors(train_ds, preload, "train")
+        pre_val = _preload_tensors(val_ds, preload, "val")
+
     # Init Model — out_channels adapts to the target feature shape
-    model = LatCH(in_channels=64, out_channels=out_channels, dim=256, depth=6, num_heads=8).to(device)
+    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth, num_heads=num_heads).to(device)
+    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads} "
+          f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
     
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     
@@ -276,8 +325,15 @@ def train(
         model.eval()
         vg = torch.Generator(device=device).manual_seed(1234)
         losses = []
+        def _vbatches():
+            if pre_val is not None:
+                Lv, Tv = pre_val
+                for i in range(0, Lv.shape[0], batch_size):
+                    yield Lv[i:i + batch_size], Tv[i:i + batch_size]
+            else:
+                yield from val_loader
         with torch.no_grad():
-            for v_lat, v_tgt in val_loader:
+            for v_lat, v_tgt in _vbatches():
                 v_lat = v_lat.to(device); v_tgt = v_tgt.to(device)
                 Bv = v_lat.size(0)
                 tv = torch.rand((Bv,), device=device, generator=vg)
@@ -302,6 +358,8 @@ def train(
         "lr": lr, "batch_size": batch_size, "epochs": epochs, "val_frac": val_frac,
         "out_channels": out_channels, "tag": tag,
         "smooth_kind": smooth_kind, "smooth_width": smooth_width, "subset_frac": subset_frac,
+        "holdout_frac": holdout_frac, "preload": preload,
+        "dim": dim, "depth": depth, "num_heads": num_heads,
         **{f"stat_{k}": v for k, v in feature_stats.items()},
     }
     tb = None
@@ -403,8 +461,20 @@ def train(
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
-        
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
+
+        if pre_train is not None:
+            Lt, Tt = pre_train
+            Nt = Lt.shape[0]
+            perm = torch.randperm(Nt, device=Lt.device)
+            n_batches = (Nt + batch_size - 1) // batch_size
+            def _train_batches():
+                for i in range(0, Nt, batch_size):
+                    b = perm[i:i + batch_size]
+                    yield Lt[b], Tt[b]
+            pbar = tqdm(_train_batches(), total=n_batches, desc=f"Epoch {epoch+1}/{epochs}")
+        else:
+            n_batches = len(loader)
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
         for latents, targets in pbar:
             latents = latents.to(device) # [B, 64, T]
             targets = targets.to(device) # [B, 1, T]
@@ -439,7 +509,7 @@ def train(
             if (tb is not None or wb is not None) and global_step % 50 == 0:
                 log_scalars({"train/loss_step": loss.item()}, global_step)
             
-        avg_loss = total_loss / len(loader)
+        avg_loss = total_loss / n_batches
         val_mean, val_median = validate()
         print(f"Epoch {epoch+1}: train_avg={avg_loss:.4f}  "
               f"val_mean={val_mean:.4f}  val_median={val_median:.4f}")
@@ -461,6 +531,8 @@ def train(
             "smooth_kind": smooth_kind,   # envelope smoothing applied to the marker target
             "smooth_width": smooth_width,
             "subset_frac": subset_frac,
+            "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
+            "dim": dim, "depth": depth, "num_heads": num_heads,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
@@ -526,6 +598,20 @@ if __name__ == "__main__":
                         help="deterministically train on a fraction of the data (e.g. 0.3) — "
                              "for quick smoothing-kind bake-offs; seeded so it's reproducible")
     parser.add_argument("--subset-seed", type=int, default=None)
+    parser.add_argument("--holdout-frac", type=float, default=None,
+                        help="reserve a fixed holdout (e.g. 0.05) used as the val set; "
+                             "IDENTICAL across runs (separate seed), so val_median is "
+                             "comparable for subset-vs-full ablations")
+    parser.add_argument("--holdout-seed", type=int, default=None)
+    parser.add_argument("--preload", type=str, default=None,
+                        choices=["none", "ram", "gpu"],
+                        help="preload (latent,target) into RAM or VRAM once so epochs are "
+                             "GPU-bound (no per-step DB/disk). gpu requires the set to fit VRAM")
+    parser.add_argument("--dim", type=int, default=None,
+                        help="head width (256-aligned: 256/512/768/1024/1536). Bigger = more "
+                             "capacity but ~linearly slower (see latch_shape_bench.py)")
+    parser.add_argument("--depth", type=int, default=None, help="head transformer depth")
+    parser.add_argument("--num-heads", type=int, default=None, help="attention heads")
     args = parser.parse_args()
 
     ycfg = {}
@@ -558,4 +644,10 @@ if __name__ == "__main__":
         smooth_width=pick(args.smooth_width, "smooth_width", 0.0),
         subset_frac=pick(args.subset_frac, "subset_frac", 1.0),
         subset_seed=pick(args.subset_seed, "subset_seed", 0),
+        holdout_frac=pick(args.holdout_frac, "holdout_frac", 0.0),
+        holdout_seed=pick(args.holdout_seed, "holdout_seed", 12345),
+        preload=pick(args.preload, "preload", "none"),
+        dim=pick(args.dim, "dim", 256),
+        depth=pick(args.depth, "depth", 6),
+        num_heads=pick(args.num_heads, "num_heads", 8),
     )

@@ -185,6 +185,8 @@ class LatCHDataset(Dataset):
         smooth_width: float = 0.0,
         subset_frac: float = 1.0,
         subset_seed: int = 0,
+        holdout_frac: float = 0.0,
+        holdout_seed: int = 12345,
     ):
         self.latent_dir      = Path(latent_dir)
         self.info_dir        = Path(info_dir) if info_dir else None
@@ -198,6 +200,9 @@ class LatCHDataset(Dataset):
         self.smooth_width    = float(smooth_width)
         self.subset_frac     = float(subset_frac)
         self.subset_seed     = int(subset_seed)
+        # Shared fixed holdout (separate seed) for subset-vs-full comparisons.
+        self.holdout_frac    = float(holdout_frac)
+        self.holdout_seed    = int(holdout_seed)
 
         # Canonical name is bare (no _ts).  We always append _ts for DB lookups.
         self.bare_feature    = target_feature.removesuffix("_ts")
@@ -237,8 +242,30 @@ class LatCHDataset(Dataset):
 
         print(f"Found {len(self.items)} latent files.")
 
-        # Deterministic subset (seeded) — for quick smoothing-kind bake-offs on a fraction.
-        if self.subset_frac < 1.0 and self.items:
+        # Index lists for the shared-holdout split (None unless holdout_frac > 0).
+        self.holdout_indices = None
+        self.train_indices = None
+
+        if self.holdout_frac > 0 and self.items:
+            # Carve a fixed holdout from the FULL population (separate seed) so it is
+            # IDENTICAL across subset/full runs; keep self.items full so torch.Subset
+            # can serve both the train pool and the holdout. subset_frac then shrinks
+            # only the train pool (the holdout is never trained on, in either run).
+            N = len(self.items)
+            perm = np.random.RandomState(self.holdout_seed).permutation(N)
+            h = max(1, int(round(self.holdout_frac * N)))
+            hold, pool = perm[:h], perm[h:]
+            if self.subset_frac < 1.0:
+                ps = np.random.RandomState(self.subset_seed).permutation(len(pool))
+                keep = max(1, int(round(self.subset_frac * len(pool))))
+                pool = pool[ps[:keep]]
+            self.holdout_indices = sorted(hold.tolist())
+            self.train_indices = sorted(pool.tolist())
+            print(f"Holdout: {len(self.holdout_indices)} held out (frac={self.holdout_frac}, "
+                  f"seed={self.holdout_seed}); train pool {len(self.train_indices)} "
+                  f"(subset_frac={self.subset_frac})")
+        elif self.subset_frac < 1.0 and self.items:
+            # Deterministic subset (seeded) — for quick smoothing-kind bake-offs on a fraction.
             rng = np.random.RandomState(self.subset_seed)
             keep = max(1, int(round(self.subset_frac * len(self.items))))
             sel = sorted(rng.permutation(len(self.items))[:keep].tolist())

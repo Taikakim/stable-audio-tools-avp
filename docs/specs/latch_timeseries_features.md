@@ -80,20 +80,27 @@ LatCH targets must align frame-for-frame with the VAE latent the head reads.
 3. **Rhythmic features first.** Priority order: onset-strength envelope (per stem),
    beat/downbeat activations, then a per-frame syncopation / on-beat-ratio /
    rhythmic-density envelope (the scalar `per_stem_rhythm` measures, but windowed).
-4. **Store raw/continuous envelopes, not pre-smoothed.** Smoothing kind/width is a
-   *training-time* knob (already implemented consumer-side — gaussian / linear /
-   lowpass / beat_weighted, see §7). Storing raw lets us sweep smoothing without
-   re-extraction. (Onset *strength* is naturally continuous; beat/downbeat markers
-   are sparse — keep them raw, smoothing happens downstream.)
-5. **Naming convention:** `<feature>_<stem>_ts` for stems (e.g.
+4. **USE madmom's native SOFT PROBABILITIES (decided 2026-05-26).** madmom's beat/
+   downbeat/onset RNN-TCN models emit a per-frame *probability* (already continuous,
+   peaks at events) — i.e. exactly the dense envelope we were reconstructing by
+   gaussian-smoothing the old *binary* markers. Store those soft activations directly.
+   This makes downstream smoothing a **width-tuning knob on already-continuous data**,
+   not the binary→continuous *fix* it was (see §7). Empirically, on the old librosa
+   data, `gaussian` smoothing beat all alternatives — `linear`/`lowpass`/`beat_weighted`
+   were worse (the on-beat-weighted variant was the *worst*), so a light gaussian (or
+   none, since madmom is already soft) is the expected default; re-probe once re-analysed.
+5. **Store raw/continuous envelopes, not pre-smoothed.** Storing the raw soft
+   activation lets us sweep smoothing width downstream without re-extraction. (Smoothing
+   kinds are implemented consumer-side — gaussian / linear / lowpass / beat_weighted, §7.)
+6. **Naming convention:** `<feature>_<stem>_ts` for stems (e.g.
    `onsets_activations_drums_ts`), bare `<feature>_ts` for full mix. Stem ∈
    `{drums, bass, other, vocals}`.
-6. **Keying:** keep the full-mix crop stem as the join key (`"Artist - Title_<n>"`),
+7. **Keying:** keep the full-mix crop stem as the join key (`"Artist - Title_<n>"`),
    OR move to whole-track keys + a (track, offset) crop index — decide in §8.
-7. **Sourcing for stems:** prefer the original separated-stem audio if remountable;
+8. **Sourcing for stems:** prefer the original separated-stem audio if remountable;
    otherwise decode the existing stem VAE latents → audio → extract (lossy but
    transient-preserving; validate onset detection on a few clips first).
-8. **Don't break the existing DB.** Either add new fields/keys to `timeseries.db`
+9. **Don't break the existing DB.** Either add new fields/keys to `timeseries.db`
    or write a sidecar store; the 2.7 GB DB is shared with the MIR project.
 
 ## 6. What LatCH needs per entry (consumer contract)

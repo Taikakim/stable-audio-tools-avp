@@ -37,41 +37,32 @@ tag: dens_gauss3                # overridden per run with --tag
 save_dir: latch_weights
 latent_dir: /run/media/kim/Lehto/latents
 
-amd:
-  PYTORCH_TUNABLEOP_ENABLED: "1"
-  PYTORCH_TUNABLEOP_TUNING: "1"
-  PYTORCH_TUNABLEOP_VERBOSE: "1"
-  PYTORCH_TUNABLEOP_FILENAME: /home/kim/pytorch-tunings-7.2.2/tunableop_results.csv
-  PYTORCH_SDP_KERNEL_VERBOSE: "1"
-  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.6,max_split_size_mb:512
-  PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
-  HIP_FORCE_DEV_KERNARG: "1"
-  MIOPEN_FIND_MODE: "6"
-  MIOPEN_CUSTOM_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/miopen/cache
-  MIOPEN_USER_DB_PATH: /home/kim/pytorch-tunings-7.2.2/miopen/db
-  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
-  TRITON_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/triton_cache
-  OMP_NUM_THREADS: "8"
+# ROCm/AMD env: deferred to rocm_env.yaml's `training` profile (single source of
+# truth). train_latch.py applies it before importing torch when no `amd:` section
+# is present here — keeps this config version-agnostic (no stale tunings path).
 
 wandb: true
 wandb_project: latch
 tensorboard: false
 
-# Optional listen at the final epoch: low vs high density, same seed (kind=constant
-# because a density head sets a LEVEL, not a beat grid). Values are raw smoothed-
-# envelope units; guidance standardizes internally. A/B the extremes by ear.
-test:
-  model_config: models/checkpoints/small/base_model_config.json
-  ckpt_path:    models/checkpoints/small/base_model.ckpt
-  every_epochs: 4
-  steps: 20
-  prompt: "techno groove, drums and percussion, snappy kick, hats"
-  seed: 42
-  cfg_scale: 3.0
-  kind: constant
-  target_value: [0.05, 0.5]
-  window: [0.4, 1.0]
-  gain: 8.0
-  gamma: 0.3
-  n_iter: 6
-  weight: 10.0
+# Test-inference DISABLED for the bake-off: it only needs val_median to pick a
+# smoothing kind, and the VAE decode currently crashes in MIOpen under the fresh
+# ROCm/torch-2.10 build (stale 7.2.3/miopen cache → GemmFwdRest solver assertion).
+# A/B the winner by ear in the gradio UI, or re-enable this block once MIOpen is
+# sorted. (Was: kind=constant, target_value [0.05, 0.5], gain 8, weight 10.)
+#
+# test:
+#   model_config: models/checkpoints/small/base_model_config.json
+#   ckpt_path:    models/checkpoints/small/base_model.ckpt
+#   every_epochs: 4
+#   steps: 20
+#   prompt: "techno groove, drums and percussion, snappy kick, hats"
+#   seed: 42
+#   cfg_scale: 3.0
+#   kind: constant
+#   target_value: [0.05, 0.5]
+#   window: [0.4, 1.0]
+#   gain: 8.0
+#   gamma: 0.3
+#   n_iter: 6
+#   weight: 10.0
