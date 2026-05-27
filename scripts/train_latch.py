@@ -169,6 +169,9 @@ def train(
     dim=256,
     depth=6,
     num_heads=8,
+    optimizer_name="adamw",
+    scheduler="none",
+    save_best_only=False,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
@@ -276,7 +279,31 @@ def train(
     print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads} "
           f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
     
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree
+    _is_sf = optimizer_name == "schedulefree"
+    if optimizer_name == "lion":
+        from lion_pytorch import Lion
+        optimizer = Lion(model.parameters(), lr=lr, weight_decay=1e-2)
+    elif optimizer_name == "prodigy":
+        from prodigyopt import Prodigy
+        # LR-free: it adapts d; lr is a base multiplier (use 1.0) and wants a scheduler.
+        optimizer = Prodigy(model.parameters(), lr=lr, weight_decay=0.0,
+                            safeguard_warmup=True, use_bias_correction=True)
+    elif optimizer_name == "adam8bit":
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(model.parameters(), lr=lr)
+    elif optimizer_name == "schedulefree":
+        from schedulefree import AdamWScheduleFree
+        # No external LR schedule by design; needs .train()/.eval() toggling (handled below).
+        warmup = max(100, int(0.05 * epochs * max(1, n_train // batch_size)))
+        optimizer = AdamWScheduleFree(model.parameters(), lr=lr, warmup_steps=warmup)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+    sched = None
+    if scheduler == "cosine" and not _is_sf:
+        sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    print(f"Optimizer: {optimizer_name} (lr={lr}); "
+          f"scheduler: {'none (schedule-free)' if _is_sf else scheduler}")
     
     # Decide loss based on feature type (use dataset.bare_feature for matching)
     bare = dataset.bare_feature
@@ -323,6 +350,9 @@ def train(
     def validate():
         """Held-out loss with FIXED noise/timesteps so it's comparable across epochs."""
         model.eval()
+        if _is_sf:
+            optimizer.eval()    # schedule-free: switch to AVERAGED weights for val + checkpoint
+                                # (left in eval; the next epoch's optimizer.train() resumes)
         vg = torch.Generator(device=device).manual_seed(1234)
         losses = []
         def _vbatches():
@@ -360,6 +390,7 @@ def train(
         "smooth_kind": smooth_kind, "smooth_width": smooth_width, "subset_frac": subset_frac,
         "holdout_frac": holdout_frac, "preload": preload,
         "dim": dim, "depth": depth, "num_heads": num_heads,
+        "optimizer": optimizer_name, "scheduler": scheduler,
         **{f"stat_{k}": v for k, v in feature_stats.items()},
     }
     tb = None
@@ -460,6 +491,8 @@ def train(
 
     for epoch in range(epochs):
         model.train()
+        if _is_sf:
+            optimizer.train()   # schedule-free: live weights for training (resumes after each eval)
         total_loss = 0.0
 
         if pre_train is not None:
@@ -533,12 +566,16 @@ def train(
             "subset_frac": subset_frac,
             "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
             "dim": dim, "depth": depth, "num_heads": num_heads,
+            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
         }
         ep_ckpt = os.path.join(save_dir, f"{stem}_ep{epoch+1}.pt")
-        torch.save(checkpoint, ep_ckpt)
+        if not save_best_only:            # keep only _best.pt during sweeps (disk)
+            torch.save(checkpoint, ep_ckpt)
+        if sched is not None:
+            sched.step()
 
         # Keep a best-by-val-median copy (the outlier-robust convergence signal)
         if val_median == val_median and val_median < best_val_median:  # not NaN and improved
@@ -612,6 +649,14 @@ if __name__ == "__main__":
                              "capacity but ~linearly slower (see latch_shape_bench.py)")
     parser.add_argument("--depth", type=int, default=None, help="head transformer depth")
     parser.add_argument("--num-heads", type=int, default=None, help="attention heads")
+    parser.add_argument("--optimizer", type=str, default=None,
+                        choices=["adamw", "lion", "prodigy", "adam8bit", "schedulefree"],
+                        help="adamw | lion (~3-10x lower LR) | prodigy (LR-free, lr=1.0) | "
+                             "adam8bit (bnb, low-mem) | schedulefree (no LR schedule; .train()/.eval() handled)")
+    parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
+                        help="LR schedule: none (constant) | cosine (anneal over --epochs)")
+    parser.add_argument("--save-best-only", action="store_true",
+                        help="only keep <stem>_best.pt (no per-epoch checkpoints) — for sweeps")
     args = parser.parse_args()
 
     ycfg = {}
@@ -650,4 +695,7 @@ if __name__ == "__main__":
         dim=pick(args.dim, "dim", 256),
         depth=pick(args.depth, "depth", 6),
         num_heads=pick(args.num_heads, "num_heads", 8),
+        optimizer_name=pick(args.optimizer, "optimizer", "adamw"),
+        scheduler=pick(args.scheduler, "scheduler", "none"),
+        save_best_only=args.save_best_only or bool(ycfg.get("save_best_only", False)),
     )
