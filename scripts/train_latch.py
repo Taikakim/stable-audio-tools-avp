@@ -165,6 +165,8 @@ def train(
     subset_seed=0,
     holdout_frac=0.0,
     holdout_seed=12345,
+    target_source="db",
+    npz_root=None,
     preload="none",
     dim=256,
     depth=6,
@@ -172,8 +174,18 @@ def train(
     optimizer_name="adamw",
     scheduler="none",
     save_best_only=False,
+    seed=0,
 ):
     os.makedirs(save_dir, exist_ok=True)
+    # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
+    # reproducible and seed-variance is measurable. (GPU GEMM atomics aren't bit-exact,
+    # so same-seed runs are very close but not necessarily identical.)
+    if seed is not None:
+        import random as _random
+        _random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Seed: {seed}")
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
     # so it's distinguishable in latch_weights/ and the UI dropdown.
     stem = f"latch_{target_feature}" + (f"_{tag}" if tag else "")
@@ -196,6 +208,7 @@ def train(
         smooth_kind=smooth_kind, smooth_width=smooth_width,
         subset_frac=subset_frac, subset_seed=subset_seed,
         holdout_frac=holdout_frac, holdout_seed=holdout_seed,
+        target_source=target_source, npz_root=npz_root,
     )
     if len(dataset) == 0:
         print("No valid latent-INFO pairs found. Make sure external drives are mounted.")
@@ -566,7 +579,7 @@ def train(
             "subset_frac": subset_frac,
             "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
             "dim": dim, "depth": depth, "num_heads": num_heads,
-            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr,
+            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr, "seed": seed,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
@@ -610,6 +623,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr",         type=float, default=None)
     parser.add_argument("--latent-dir", type=str,   default=None)
     parser.add_argument("--db-path",    type=str,   default=None)
+    parser.add_argument("--target-source", type=str, default=None,
+                        choices=["db", "whole_track"],
+                        help="'db' = legacy per-crop TimeseriesDB; 'whole_track' = slice "
+                             "the crop window from a whole-track .TIMESERIES.npz (per-stem "
+                             "onset envelopes, raw madmom soft activations, etc.)")
+    parser.add_argument("--npz-root", type=str, default=None,
+                        help="Whole-track npz dir (default /run/media/kim/Lehto/timeseries)")
     parser.add_argument("--save-dir",   type=str,   default=None)
     parser.add_argument("--val-frac",   type=float, default=None)
     parser.add_argument("--num-workers", type=int,  default=None)
@@ -657,6 +677,8 @@ if __name__ == "__main__":
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
                         help="only keep <stem>_best.pt (no per-epoch checkpoints) — for sweeps")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="training RNG seed (reproducible runs; vary it for seed-variance)")
     args = parser.parse_args()
 
     ycfg = {}
@@ -691,6 +713,8 @@ if __name__ == "__main__":
         subset_seed=pick(args.subset_seed, "subset_seed", 0),
         holdout_frac=pick(args.holdout_frac, "holdout_frac", 0.0),
         holdout_seed=pick(args.holdout_seed, "holdout_seed", 12345),
+        target_source=pick(args.target_source, "target_source", "db"),
+        npz_root=pick(args.npz_root, "npz_root", None),
         preload=pick(args.preload, "preload", "none"),
         dim=pick(args.dim, "dim", 256),
         depth=pick(args.depth, "depth", 6),
@@ -698,4 +722,5 @@ if __name__ == "__main__":
         optimizer_name=pick(args.optimizer, "optimizer", "adamw"),
         scheduler=pick(args.scheduler, "scheduler", "none"),
         save_best_only=args.save_best_only or bool(ycfg.get("save_best_only", False)),
+        seed=pick(args.seed, "seed", 0),
     )

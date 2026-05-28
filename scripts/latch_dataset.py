@@ -187,7 +187,14 @@ class LatCHDataset(Dataset):
         subset_seed: int = 0,
         holdout_frac: float = 0.0,
         holdout_seed: int = 12345,
+        target_source: str = "db",
+        npz_root: Optional[str] = None,
     ):
+        # target_source: "db" = legacy per-crop TimeseriesDB; "whole_track" = slice
+        # the crop window out of a whole-track .TIMESERIES.npz (per-stem onset
+        # envelopes, raw madmom soft activations, etc.). See whole_track_target_source.
+        self.target_source   = target_source
+        self.use_wt          = (target_source == "whole_track")
         self.latent_dir      = Path(latent_dir)
         self.info_dir        = Path(info_dir) if info_dir else None
         self.max_frames      = max_frames
@@ -210,9 +217,20 @@ class LatCHDataset(Dataset):
         # is_ts_feature is True for all known DB-backed features
         self.is_ts_feature   = _is_ts_feature(self.ts_feature)
 
-        # Open TimeseriesDB (one connection per Dataset instance)
+        # Target backend (one per Dataset instance): either the legacy TimeseriesDB
+        # or the whole-track npz source. Only relevant for _ts features.
         self._db: Optional["TimeseriesDB"] = None
-        if self.is_ts_feature:
+        self._wt = None
+        if self.is_ts_feature and self.use_wt:
+            import os as _os
+            import sys as _sys
+            _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+            from whole_track_target_source import WholeTrackTargetSource
+            root = npz_root or "/run/media/kim/Lehto/timeseries"
+            self._wt = WholeTrackTargetSource(root)
+            print(f"WholeTrackTargetSource: {root}")
+            print(f"Target feature        : '{self.bare_feature}' → npz field '{self.ts_feature}'")
+        elif self.is_ts_feature:
             if not HAS_TSDB:
                 raise ImportError(
                     "TimeseriesDB not importable — add /home/kim/Projects/mir/src "
@@ -272,6 +290,23 @@ class LatCHDataset(Dataset):
             self.items = [self.items[i] for i in sel]
             print(f"Subset: kept {len(self.items)} items (frac={self.subset_frac}, seed={self.subset_seed})")
 
+        # Whole-track mode: fail fast if the first track's npz lacks the field.
+        if self.items and self.is_ts_feature and self._wt is not None:
+            npy0, key0 = self.items[0]
+            try:
+                info0 = self._load_info(npy0, key0)
+                st0, et0 = info0.get("start_time"), info0.get("end_time")
+                probe = (self._wt.get(key0, self.ts_feature, float(st0), float(et0), self.max_frames)
+                         if st0 is not None and et0 is not None else None)
+                if probe is None:
+                    print(f"WARNING: '{self.ts_feature}' not resolvable for '{key0}' — "
+                          f"check npz_root and that the track has a .TIMESERIES.npz "
+                          f"with this field (items missing it are skipped at load).")
+                else:
+                    print(f"Whole-track target OK: '{self.ts_feature}' shape={tuple(probe.shape)}")
+            except Exception as _e:
+                print(f"WARNING: whole-track probe failed for '{key0}': {_e}")
+
         # Validate a sample to fail fast with a helpful message
         if self.items and self.is_ts_feature and self._db is not None:
             _, key = self.items[0]
@@ -316,7 +351,29 @@ class LatCHDataset(Dataset):
                     latent = np.pad(latent, ((0, 0), (0, self.max_frames - T_lat)))
 
                 # ---- Target ----
-                if self.is_ts_feature:
+                if self.is_ts_feature and self._wt is not None:
+                    # --- slice the crop window out of the whole-track npz ---
+                    info = self._load_info(npy_path, crop_key)
+                    st, et = info.get("start_time"), info.get("end_time")
+                    if st is None or et is None:
+                        raise ValueError(f"start_time/end_time missing in .INFO for '{crop_key}'")
+                    st, et = float(st), float(et)
+                    # get() returns (C, max_frames) channel-first, already resampled
+                    target = self._wt.get(crop_key, self.ts_feature, st, et, self.max_frames)
+                    if target is None:
+                        raise ValueError(
+                            f"'{self.ts_feature}' missing in whole-track npz for '{crop_key}'"
+                        )
+                    if self.smooth_kind not in (None, "none") and self.smooth_width > 0:
+                        beat = None
+                        if self.smooth_kind == "beat_weighted":
+                            bt = self._wt.get(crop_key, "beat_activation", st, et, self.max_frames)
+                            if bt is not None:
+                                beat = bt[0]  # [T]
+                        target = smooth_envelope(target, self.smooth_kind,
+                                                 self.smooth_width, beat=beat)
+
+                elif self.is_ts_feature:
                     # --- read from TimeseriesDB ---
                     raw = _load_ts_from_db(self._db, crop_key, self.ts_feature)
                     if raw is None:
