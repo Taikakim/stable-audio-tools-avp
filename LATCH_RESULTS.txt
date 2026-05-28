@@ -509,11 +509,29 @@ still load — `load_latch_from_checkpoint` auto-detects from state-dict
 
 Expected gain on top of compile: ~+3-5% it/s end-to-end (the attention call is
 only one of ~10 fused kernels per step, so 17% local doesn't fully propagate).
-NOT YET VALIDATED — needs a 3-epoch sanity rerun with --t-injection film to confirm
-val_median still converges to ~0.170 territory. The FiLM head's weight is
-zero-initialized (identity at step 0), so initial loss should match the concat baseline;
-divergence by epoch 3 would indicate FiLM is under-conditioning (in which case
-adaLN-zero per-block is the next step, à la DiT).
 
-run-final-retrain.sh defaults to --t-injection film + --compile.
+SANITY VALIDATION — 3-epoch reproducer at 212W/ps, seed 1, onsets_activations:
+
+   mode                  params  it/s steady  val_median best  items/Wh*
+   concat   (legacy)      4.9M    52.17        0.1696             866
+   film     (T=256)       5.0M    57.50        0.1726           ~1050   ←FA-aligned win
+   adaln_zero (DiT-style) 7.2M    55.72        0.1682  ←best    ~1020   ←CHOSEN
+   (* extrapolated total-system Wh based on warm-cache 13.55 Wh × time ratio)
+
+   FiLM throughput delta vs prediction: +10% measured vs +3-5% expected. The
+   attention call is one of ~10 fused kernels per step, so 17% local IS partially
+   eaten by Amdahl — but the elimination of the concat/strip ops (extra reshape
+   + indexing) added more than expected on the host side.
+
+   adaLN-zero won the sanity test on quality: val_median 0.1682 best
+   (FiLM 0.1726, concat 0.1696). The monotonic train trajectory
+   (0.1772 → 0.1750 → 0.1682) is the textbook sign of zero-init residual warmup
+   working as designed — gentle ramp-in, then quality settles below baseline.
+   Cost: +47% params (4.9M → 7.2M, all in the per-block adaLN_mod heads), -3%
+   throughput vs FiLM. Still ~+138% items/Wh vs the eager baseline.
+
+   For the ship retrain (40 ep × 10 heads), quality > speed at the margin and the
+   extra 2.2M params are cheap. adaln_zero is the right choice.
+
+run-final-retrain.sh defaults to --t-injection adaln_zero + --compile.
 ================================================================================
