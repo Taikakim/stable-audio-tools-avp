@@ -599,6 +599,13 @@ def train(
 
         run_test_inference(epoch, ep_ckpt, global_step)
 
+    # When --save-best-only, the per-epoch ep_ckpt was skipped; save the final epoch's
+    # state as _last.pt so we keep BOTH best (early stop) and last (full-training) heads.
+    if save_best_only:
+        last_path = os.path.join(save_dir, f"{stem}_last.pt")
+        torch.save(checkpoint, last_path)
+        print(f"  ↳ saved final epoch → {stem}_last.pt")
+
     if tb is not None:
         tb.close()
     if wb is not None:
