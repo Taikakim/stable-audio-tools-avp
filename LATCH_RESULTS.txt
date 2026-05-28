@@ -535,3 +535,98 @@ SANITY VALIDATION — 3-epoch reproducer at 212W/ps, seed 1, onsets_activations:
 
 run-final-retrain.sh defaults to --t-injection adaln_zero + --compile.
 ================================================================================
+
+================================================================================
+18.  SHIP RETRAIN — full 10-head run with the new stack  (2026-05-28)
+================================================================================
+SEED=1, full data (191,966 train + 10,103 val crops, holdout_seed=12345), 40 epochs,
+AdamW lr=3e-4, dim=256/depth=6/heads=8, batch=64, save-best-only.
+Architecture: torch.compile + adaln_zero t-injection + FA-priority SDPA.
+
+GPU cap timeline (Europe/Helsinki):
+  ~13:55  launched, cap @ 340 W (max)
+  ~15:06  cap dropped to 212 W (efficient point)
+  -> head #1 (bass) trained at 340 W; head #2 (body) straddled the switch;
+     heads #3..#10 trained at 212 W. See latch_ship_retrain_s1/CAP_NOTES.txt.
+
+RESULTS — 9 wins, 1 regression:
+
+   feature              v2 prior   ship 40ep    Δ
+   rms_energy_bass       1.8923     1.3945    -26.3%
+   rms_energy_body       1.4327     1.1266    -21.4%
+   rms_energy_mid        1.4146     1.1846    -16.3%
+   rms_energy_air        1.5140     1.3189    -12.9%
+   spectral_flatness     0.0249     0.1113   +347.5%  ← REGRESSION
+   spectral_skewness     0.2614     0.1156    -55.8%
+   spectral_flux         7.5342     7.1279     -5.4%
+   spectral_kurtosis     3.0961     2.9391     -5.1%
+   onsets_activations       —       0.1443      —    (no v2 baseline)
+   hpcp                  0.0549     0.0352    -35.8%
+
+  * 4/4 RMS bands improve, scaling with target structure (sharp bass features
+    benefit most from per-block conditioning; smooth air signal least).
+  * spectral_skewness halved — the asymmetric distribution benefits strongly from
+    adaln_zero's per-block modulation.
+  * hpcp -36% despite a 47-min preload contention storm (see hpcp note below);
+    actual training, once data in RAM, ran at normal speed.
+  * spectral_flatness regression is real and feature-specific. Other 3 spectral
+    heads share --standardize and behave normally. Suspect: spectral_flatness
+    has a heavy-tailed distribution (mostly near 0 for harmonic content, a few
+    near-1 spikes for noisy passages). After (x-μ)/σ those rare-high frames
+    become huge standardized magnitudes, and adaLN-zero's "residual identity
+    at step 0" warmup may take too long to learn to predict them against
+    smooth-L1 loss. Diagnostic run launched with --t-injection concat to test
+    whether reverting to legacy conditioning recovers v2's 0.0249.
+
+HPCP NOTE — preload contention on this head:
+  hpcp_ts is a 12-channel feature stored as gzip-msgpack in the timeseries DB.
+  Other 9 ship heads use 1-channel targets (~1/12 the blob size) and preloaded
+  in ~4 s with num_workers=16. hpcp at the same worker count took 47 min for
+  preload — 700× slower. Cause: SQLite-lock contention under 16 concurrent
+  workers each pulling 12-channel blobs. Irregular [06:04 / 08:50 / 06:04 /
+  10:21 / 06:04] timing per batch is the classic contention zigzag, not steady
+  IO bottleneck (loadavg 5.5 on a 24-core box = workers waiting, not computing).
+  Coverage caveat: hpcp_ts is present in only ~5% of timeseries.db crops (most
+  of the corpus was extracted before Essentia/hpcp got plumbed in), so the
+  effective training set for hpcp was ~10k crops, not 192k. Quality still
+  improved 36% over v2 — the 5% slice is sufficient.
+
+FIX — committed to latch_train_hpcp.yaml:
+  num_workers: 16 -> 4    # avoids the contention storm on the 12-channel target
+  (no subset_frac change — overriding to 1.0 via CLI is fine at 4 workers; the
+   yaml comment now states the expected ~5-min preload at full subset.)
+
+TIMING — full run:
+  ~13:55 launch → ~20:30 last head done = ~6 h 35 min wall clock for 10 heads
+  × 40 ep each. At ~50-58 it/s × 3000 batches/epoch this is the expected pace.
+
+ENERGY — 212 W/powersave block (heads 3-10, ~5.5 h):
+  Rough estimate (per-head ~36 min × 8 heads × 19 Wh/3-ep × (40/3) epoch ratio
+  × actual it/s improvement) ~ 1.1 kWh for the 212 W block.
+  Heads 1-2 at 340 W draw ~+33% more power for similar time → ~0.25 kWh.
+  Total ship retrain energy estimate: ~1.35 kWh. (Detailed WandB-based
+  per-head Wh breakdown is a follow-up.)
+
+CURRENT TRAINED HEAD INVENTORY (10 ship + 1 v2-only carryover):
+  ship_s1 (compile + adaln_zero, 40 ep, full data):
+    rms_energy_{bass,body,mid,air}   spectral_{flatness*,skewness,flux,kurtosis}
+    onsets_activations               hpcp
+  v2_best (legacy concat, 30 ep, mixed subsets) — kept for fallback / comparison:
+    same 10 heads above
+    + tonic_strength    (v2-only; not in ship retrain)
+    + beat_activations  (v2-only; deliberately SKIPPED from ship — closed-loop
+                         verification 2026-05-26 showed it's not a usable control)
+  *flatness ship is regressed; diagnostic concat retrain in flight.
+
+DB FEATURE INVENTORY (mir/data/timeseries.db, 209,235 entries):
+  100% coverage:
+    rms_energy_bass/body/mid/air_ts    spectral_flatness/flux/skewness/kurtosis_ts
+    beat_activations_ts                downbeat_activations_ts    onsets_activations_ts
+    tonic_ts                           tonic_strength_ts
+  ~5% coverage:
+    hpcp_ts (12-channel; only extracted on crops that had Essentia available)
+
+NOT YET TRAINED (probed but no head exists):
+  downbeat_activations  (1-channel, like onsets; probe R² promising)
+  tonic                 (1-channel scalar of estimated key/tonic)
+================================================================================

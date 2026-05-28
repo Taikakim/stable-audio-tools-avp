@@ -1,0 +1,39 @@
+# LatCH training config for HPCP (12-bin harmonic pitch-class profile / chroma).
+#
+# hpcp_ts is 12-channel; train_latch.py auto-selects COSINE loss (direction match,
+# not magnitude). The latent encodes harmony strongly (probe R²>0.5 across hpcp_*),
+# so this is a genuinely new control: steering the generation's pitch-class content
+# (key / chord colour).
+#
+# Run: python scripts/train_latch.py --config latch_train_hpcp.yaml
+#
+# NOTE: no `test:` block. hpcp guidance needs a 12-D chroma TARGET VECTOR (e.g. a
+# C-minor profile), which the trainer's scalar `target_value` can't express — so
+# periodic test-inference is disabled here. Evaluate by val loss; the chroma-target
+# UI / target builder is a follow-up (track in docs/specs + the roadmap).
+
+feature: hpcp
+objective: rectified_flow
+epochs: 30
+lr: 3.0e-4
+batch_size: 64
+num_workers: 4           # hpcp targets are 12-channel gzip-msgpack blobs (~12x the size
+                         # of 1-channel heads). 16 workers caused SQLite-lock contention
+                         # on the ship retrain (47 min preload at full subset). 4 keeps
+                         # the DB connection happy without starving the GPU.
+subset_frac: 0.3         # 60k crops (Goa-trance is redundant) — stays warm in page cache
+                         # like the density runs, so the GPU stays fed (~37 it/s).
+                         # Override to 1.0 via CLI for ship retrain; expect ~5 min preload
+                         # at num_workers=4 (vs the broken 47 min at num_workers=16).
+val_frac: 0.02
+tag: v2
+save_dir: latch_weights
+latent_dir: /run/media/kim/Lehto/latents
+
+# ROCm/AMD env: deferred to rocm_env.yaml's `training` profile (single source of
+# truth). train_latch.py applies it before importing torch when no `amd:` section
+# is present here — keeps this config version-agnostic (no stale tunings path).
+
+wandb: true
+wandb_project: latch
+tensorboard: false
