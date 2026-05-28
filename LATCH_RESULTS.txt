@@ -549,34 +549,60 @@ GPU cap timeline (Europe/Helsinki):
   -> head #1 (bass) trained at 340 W; head #2 (body) straddled the switch;
      heads #3..#10 trained at 212 W. See latch_ship_retrain_s1/CAP_NOTES.txt.
 
-RESULTS — 9 wins, 1 regression:
+RESULTS — first-pass val_median table (WARNING: misleading without unit conversion):
 
    feature              v2 prior   ship 40ep    Δ
    rms_energy_bass       1.8923     1.3945    -26.3%
    rms_energy_body       1.4327     1.1266    -21.4%
    rms_energy_mid        1.4146     1.1846    -16.3%
    rms_energy_air        1.5140     1.3189    -12.9%
-   spectral_flatness     0.0249     0.1113   +347.5%  ← REGRESSION
+   spectral_flatness     0.0249     0.1113   +347.5%  ← looked catastrophic
    spectral_skewness     0.2614     0.1156    -55.8%
    spectral_flux         7.5342     7.1279     -5.4%
    spectral_kurtosis     3.0961     2.9391     -5.1%
    onsets_activations       —       0.1443      —    (no v2 baseline)
    hpcp                  0.0549     0.0352    -35.8%
 
-  * 4/4 RMS bands improve, scaling with target structure (sharp bass features
-    benefit most from per-block conditioning; smooth air signal least).
-  * spectral_skewness halved — the asymmetric distribution benefits strongly from
-    adaln_zero's per-block modulation.
-  * hpcp -36% despite a 47-min preload contention storm (see hpcp note below);
-    actual training, once data in RAM, ran at normal speed.
-  * spectral_flatness regression is real and feature-specific. Other 3 spectral
-    heads share --standardize and behave normally. Suspect: spectral_flatness
-    has a heavy-tailed distribution (mostly near 0 for harmonic content, a few
-    near-1 spikes for noisy passages). After (x-μ)/σ those rare-high frames
-    become huge standardized magnitudes, and adaLN-zero's "residual identity
-    at step 0" warmup may take too long to learn to predict them against
-    smooth-L1 loss. Diagnostic run launched with --t-injection concat to test
-    whether reverting to legacy conditioning recovers v2's 0.0249.
+These val_medians are NOT directly comparable across v2 ↔ ship — they live in
+different loss-function units. SmoothL1 val_median scales with huber_beta and
+with whether the target is standardized, and the ship retrain changed BOTH:
+  v2 (e.g., flatness): --standardize OFF -> huber_beta = 0.5*std = 0.0739, loss in raw units
+  ship (all stdz heads): --standardize ON  -> huber_beta = 1.0, loss in standardized units
+The headline "9 wins, 1 catastrophic regression" was a unit conversion artifact.
+
+CORRECTED — median absolute error in RAW feature units (apples-to-apples):
+
+   feature               v2 raw MAE   ship raw MAE    Δ raw
+   rms_energy_bass         4.596        4.266       -7.2%
+   rms_energy_body         3.241        3.136       -3.2%
+   rms_energy_mid          3.298        3.092       -6.3%
+   rms_energy_air          3.943        3.549      -10.0%
+   spectral_flatness       0.061        0.068      +11.5%  ← mild regression (not 347%)
+   spectral_skewness       0.711        0.782       +9.9%  ← mild regression (not -56% win)
+   spectral_flux          19.256       18.615       -3.3%
+   spectral_kurtosis       9.904        7.593      -23.3%  ← real win
+
+  Reconstruction: SmoothL1(err, beta) = err²/(2β) if err<β else |err| - β/2.
+  Solve for |err| at the saved val_median, then multiply by std_std for
+  standardized heads to get back to raw feature units.
+
+Actual picture in raw units:
+  * RMS bands: small consistent improvements (3-10%), not the 13-26% the val_median
+    showed. Bass/air do best; body/mid more modest.
+  * spectral_kurtosis: real -23% improvement — the most decisive win.
+  * spectral_flux: ~at parity (-3%).
+  * spectral_flatness, spectral_skewness: mild ~+10% regressions. NOT architecture-
+    related — confirmed by a diagnostic concat retrain of flatness that landed at
+    the same raw MAE (~0.068). The likely culprit is the standardize change:
+    v2 trained these heads with --standardize OFF and an auto-derived
+    huber_beta = 0.5*std (~0.074 for flatness), giving a tighter quadratic region
+    around the true error scale. Ship trained with --standardize ON + beta=1.0,
+    which is too permissive for low-variance targets. Re-running these two heads
+    with --standardize OFF (matching v2's regime) should land at v2 quality.
+  * The new throughput stack (compile + adaln_zero + FA) is still a clear infra
+    win (+43-57% it/s, ~2x perf/Wh) — but it did NOT produce dramatic quality
+    improvements. The quality gains are modest single-digit-to-mid-teens % in
+    raw units, except for kurtosis.
 
 HPCP NOTE — preload contention on this head:
   hpcp_ts is a 12-channel feature stored as gzip-msgpack in the timeseries DB.
@@ -588,8 +614,11 @@ HPCP NOTE — preload contention on this head:
   IO bottleneck (loadavg 5.5 on a 24-core box = workers waiting, not computing).
   Coverage caveat: hpcp_ts is present in only ~5% of timeseries.db crops (most
   of the corpus was extracted before Essentia/hpcp got plumbed in), so the
-  effective training set for hpcp was ~10k crops, not 192k. Quality still
-  improved 36% over v2 — the 5% slice is sufficient.
+  effective training set for hpcp was ~10k crops, not 192k.
+  hpcp comparison NOT raw-MAE-corrected here because v2 hpcp uses COSINE loss
+  (12-channel direction match), not SmoothL1 — different metric, can't simply
+  rescale into raw units. The -36% val_median delta is therefore taken at face
+  value pending a per-bin cosine-similarity comparison.
 
 FIX — committed to latch_train_hpcp.yaml:
   num_workers: 16 -> 4    # avoids the contention storm on the 12-channel target
@@ -607,16 +636,18 @@ ENERGY — 212 W/powersave block (heads 3-10, ~5.5 h):
   Total ship retrain energy estimate: ~1.35 kWh. (Detailed WandB-based
   per-head Wh breakdown is a follow-up.)
 
-CURRENT TRAINED HEAD INVENTORY (10 ship + 1 v2-only carryover):
+CURRENT TRAINED HEAD INVENTORY (10 ship + 2 v2-only carryovers):
   ship_s1 (compile + adaln_zero, 40 ep, full data):
-    rms_energy_{bass,body,mid,air}   spectral_{flatness*,skewness,flux,kurtosis}
+    rms_energy_{bass,body,mid,air}   spectral_{flatness*,skewness*,flux,kurtosis}
     onsets_activations               hpcp
   v2_best (legacy concat, 30 ep, mixed subsets) — kept for fallback / comparison:
     same 10 heads above
     + tonic_strength    (v2-only; not in ship retrain)
     + beat_activations  (v2-only; deliberately SKIPPED from ship — closed-loop
                          verification 2026-05-26 showed it's not a usable control)
-  *flatness ship is regressed; diagnostic concat retrain in flight.
+  *flatness and skewness regressed mildly (~+10% raw MAE). Likely due to
+   --standardize being forced on; v2 trained these without it. A targeted
+   retrain WITHOUT --standardize is the suggested fix (not yet run).
 
 DB FEATURE INVENTORY (mir/data/timeseries.db, 209,235 entries):
   100% coverage:
