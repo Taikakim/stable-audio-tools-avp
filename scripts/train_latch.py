@@ -174,8 +174,21 @@ def train(
     optimizer_name="adamw",
     scheduler="none",
     save_best_only=False,
+    seed=0,
+    compile_model=False,
+    compile_mode="default",
+    t_injection="film",
 ):
     os.makedirs(save_dir, exist_ok=True)
+    # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
+    # reproducible and seed-variance is measurable. (GPU GEMM atomics aren't bit-exact,
+    # so same-seed runs are very close but not necessarily identical.)
+    if seed is not None:
+        import random as _random
+        _random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Seed: {seed}")
     # Checkpoint name stem; --tag adds a version label (e.g. v2) into the filename
     # so it's distinguishable in latch_weights/ and the UI dropdown.
     stem = f"latch_{target_feature}" + (f"_{tag}" if tag else "")
@@ -278,9 +291,14 @@ def train(
         pre_val = _preload_tensors(val_ds, preload, "val")
 
     # Init Model — out_channels adapts to the target feature shape
-    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth, num_heads=num_heads).to(device)
-    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads} "
+    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth,
+                  num_heads=num_heads, t_injection=t_injection).to(device)
+    raw_model = model  # uncompiled handle — used for state_dict() to keep checkpoints prefix-free
+    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads}, t_injection={t_injection} "
           f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
+    if compile_model:
+        model = torch.compile(model, mode=compile_mode)
+        print(f"torch.compile: mode={compile_mode} (1st-iter warmup will spike)")
     
     # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree
     _is_sf = optimizer_name == "schedulefree"
@@ -553,7 +571,7 @@ def train(
                      "val/median": val_median, "epoch": epoch + 1}, global_step)
 
         checkpoint = {
-            "state_dict": model.state_dict(),
+            "state_dict": raw_model.state_dict(),
             "feature_name": target_feature,
             "feature_stats": feature_stats,
             "target_kind_default": target_kind_default,
@@ -569,7 +587,8 @@ def train(
             "subset_frac": subset_frac,
             "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
             "dim": dim, "depth": depth, "num_heads": num_heads,
-            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr,
+            "t_injection": t_injection,   # 'concat' (legacy, T=257) | 'film' (T=256, FA-aligned)
+            "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr, "seed": seed,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
@@ -588,6 +607,13 @@ def train(
             log_scalars({"best/val_median": best_val_median}, global_step)
 
         run_test_inference(epoch, ep_ckpt, global_step)
+
+    # When --save-best-only, the per-epoch ep_ckpt was skipped; save the final epoch's
+    # state as _last.pt so we keep BOTH best (early stop) and last (full-training) heads.
+    if save_best_only:
+        last_path = os.path.join(save_dir, f"{stem}_last.pt")
+        torch.save(checkpoint, last_path)
+        print(f"  ↳ saved final epoch → {stem}_last.pt")
 
     if tb is not None:
         tb.close()
@@ -667,6 +693,18 @@ if __name__ == "__main__":
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
                         help="only keep <stem>_best.pt (no per-epoch checkpoints) — for sweeps")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="training RNG seed (reproducible runs; vary it for seed-variance)")
+    parser.add_argument("--compile", dest="compile_model", action="store_true",
+                        help="wrap the head with torch.compile (Inductor); 1st iter slow, rest faster")
+    parser.add_argument("--compile-mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode (default | reduce-overhead | max-autotune)")
+    parser.add_argument("--t-injection", type=str, default=None,
+                        choices=["concat", "film", "adaln_zero"],
+                        help="timestep injection: 'film' (default, T=256, FA-aligned) | "
+                             "'adaln_zero' (DiT-style per-block, +~50% params, stronger conditioning) | "
+                             "'concat' (legacy, T=257, prepended timestep token)")
     args = parser.parse_args()
 
     ycfg = {}
@@ -710,4 +748,8 @@ if __name__ == "__main__":
         optimizer_name=pick(args.optimizer, "optimizer", "adamw"),
         scheduler=pick(args.scheduler, "scheduler", "none"),
         save_best_only=args.save_best_only or bool(ycfg.get("save_best_only", False)),
+        seed=pick(args.seed, "seed", 0),
+        compile_model=args.compile_model or bool(ycfg.get("compile", False)),
+        compile_mode=pick(args.compile_mode, "compile_mode", "default"),
+        t_injection=pick(args.t_injection, "t_injection", "film"),
     )

@@ -10,6 +10,12 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+# Restrict SDPA to fast backends. MATH is ~19x slower at this head's shape and we
+# never want a silent fallback. Through torch.compile, Inductor preserves SDPA as
+# an external aten call so this priority still applies.
+_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 # ── Rotary Position Embedding ──────────────────────────────────────────────
@@ -59,7 +65,8 @@ class LatCHAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        with sdpa_kernel(_SDPA_BACKENDS):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         y = y.transpose(1, 2).reshape(B, T, C)
         return self.proj(y)
 
@@ -80,6 +87,39 @@ class LatCHBlock(nn.Module):
     def forward(self, x, cos, sin):
         x = x + self.attn(self.norm1(x), cos, sin)
         x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class LatCHBlockAdaLN(nn.Module):
+    """DiT-style adaLN-zero block. Each block receives t_emb and produces 6
+    modulators (γ1,β1,α1 for attention path; γ2,β2,α2 for MLP path). The final
+    linear is zero-initialized so all modulators are 0 at step 0 → residual
+    contributions vanish (block is identity), and the model warms up safely.
+    """
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = LatCHAttention(dim, num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        hidden_features = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_features),
+            nn.GELU(),
+            nn.Linear(hidden_features, dim),
+        )
+        self.adaLN_mod = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        nn.init.zeros_(self.adaLN_mod[-1].weight)
+        nn.init.zeros_(self.adaLN_mod[-1].bias)
+
+    def forward(self, x, t_emb, cos, sin):
+        g1, b1, a1, g2, b2, a2 = self.adaLN_mod(t_emb).chunk(6, dim=-1)
+        n1 = self.norm1(x) * (1 + g1.unsqueeze(1)) + b1.unsqueeze(1)
+        x = x + a1.unsqueeze(1) * self.attn(n1, cos, sin)
+        n2 = self.norm2(x) * (1 + g2.unsqueeze(1)) + b2.unsqueeze(1)
+        x = x + a2.unsqueeze(1) * self.mlp(n2)
         return x
 
 
@@ -120,17 +160,29 @@ class LatCH(nn.Module):
         depth=6,
         num_heads=8,
         mlp_ratio=4.0,
+        t_injection="concat",
     ):
         super().__init__()
+        assert t_injection in ("concat", "film", "adaln_zero"), f"unknown t_injection={t_injection!r}"
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.dim = dim
         self.depth = depth
+        self.t_injection = t_injection
 
         self.latent_proj = nn.Linear(in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
+        # FiLM head: outputs (scale, shift) applied once after latent_proj.
+        # Eliminates the prepend-token trick so T stays at 256 (FA-aligned: 17% faster
+        # attention than T=257). Only present in 'film' mode; absent in legacy 'concat'.
+        if t_injection == "film":
+            self.t_film = nn.Linear(dim, 2 * dim)
+            nn.init.zeros_(self.t_film.weight)  # identity init: x untouched at step 0
+            nn.init.zeros_(self.t_film.bias)
+        # adaLN-zero: each block carries its own modulation MLP; T=256.
+        block_cls = LatCHBlockAdaLN if t_injection == "adaln_zero" else LatCHBlock
         self.blocks = nn.ModuleList(
-            [LatCHBlock(dim, num_heads, mlp_ratio) for _ in range(depth)]
+            [block_cls(dim, num_heads, mlp_ratio) for _ in range(depth)]
         )
         self.norm_final = nn.LayerNorm(dim)
         self.out_proj = nn.Linear(dim, out_channels)
@@ -145,14 +197,31 @@ class LatCH(nn.Module):
         B, C, T_seq = x.shape
         x = x.transpose(1, 2)                       # → [B, T, C]
         x = self.latent_proj(x)
-        t_emb = self.t_embedder(t).unsqueeze(1)      # [B, 1, dim]
-        x = torch.cat([t_emb, x], dim=1)             # [B, T+1, dim]
-        pos = torch.arange(T_seq + 1, device=x.device).float()
-        cos, sin = self.rotary_emb(pos)
-        for block in self.blocks:
-            x = block(x, cos, sin)
-        x = self.norm_final(x)
-        x = x[:, 1:, :]                              # strip t-token
+        t_emb = self.t_embedder(t)                   # [B, dim]
+
+        if self.t_injection == "film":
+            scale, shift = self.t_film(t_emb).chunk(2, dim=-1)
+            x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            pos = torch.arange(T_seq, device=x.device).float()
+            cos, sin = self.rotary_emb(pos)
+            for block in self.blocks:
+                x = block(x, cos, sin)
+            x = self.norm_final(x)
+        elif self.t_injection == "adaln_zero":
+            pos = torch.arange(T_seq, device=x.device).float()
+            cos, sin = self.rotary_emb(pos)
+            for block in self.blocks:
+                x = block(x, t_emb, cos, sin)
+            x = self.norm_final(x)
+        else:  # concat (legacy)
+            x = torch.cat([t_emb.unsqueeze(1), x], dim=1)
+            pos = torch.arange(T_seq + 1, device=x.device).float()
+            cos, sin = self.rotary_emb(pos)
+            for block in self.blocks:
+                x = block(x, cos, sin)
+            x = self.norm_final(x)
+            x = x[:, 1:, :]                          # strip t-token
+
         out = self.out_proj(x)                        # [B, T, out_channels]
         return out.transpose(1, 2)                    # [B, out_channels, T]
 
@@ -184,6 +253,16 @@ def load_latch_from_checkpoint(path: str, device="cpu") -> LatCH:
     depth        = sum(1 for k in state if k.endswith(".attn.qkv.weight"))
     num_heads_dim = state["rotary_emb.inv_freq"].shape[0] * 2
     num_heads    = dim // num_heads_dim
+    # Infer t-injection mode from state-dict: 'adaln_zero' has per-block adaLN_mod tensors,
+    # 'film' has a top-level t_film.* tensor, 'concat' has neither. Metadata may override.
+    if metadata.get("t_injection"):
+        t_injection = metadata["t_injection"]
+    elif any(k.endswith(".adaLN_mod.1.weight") for k in state):
+        t_injection = "adaln_zero"
+    elif "t_film.weight" in state:
+        t_injection = "film"
+    else:
+        t_injection = "concat"
 
     model = LatCH(
         in_channels=in_channels,
@@ -191,6 +270,7 @@ def load_latch_from_checkpoint(path: str, device="cpu") -> LatCH:
         dim=dim,
         depth=depth,
         num_heads=num_heads,
+        t_injection=t_injection,
     )
     model.load_state_dict(state)
     model.eval()
