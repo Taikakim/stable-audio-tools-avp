@@ -1,0 +1,53 @@
+# LatCH training config — FusionOpt + TemporalShapeLoss.
+#
+# Joint optimiser + temporal-aware loss for LatCH heads. Spec:
+#   docs/superpowers/specs/2026-05-29-fusion-optimiser-design.md
+#
+# FusionOpt fuses Muon (spectral orthogonalisation), MONA (curvature-aware
+# Nesterov), KL-Shampoo (Kronecker covariance preconditioner) and ScheduleFree+
+# (Polyak step + iterant averaging + WD on fast iterate). Bifurcated routing:
+# 256-grid 2D matrices → spectral path; small/odd matrices and 1D params →
+# scalar path (ScheduleFree-AdamW). Shared Polyak step size, all GPU-resident.
+#
+# TemporalShapeLoss augments SmoothL1 with derivative (direction of events)
+# and multi-scale L1 (shape of temporal superstructures) terms.
+#
+# Run: python scripts/train_latch.py --config latch_train_fusion.yaml --feature <feat>
+#
+# This config is feature-agnostic — pair with --feature <name> on the CLI.
+
+# --- Core training ---
+optimizer: fusion
+loss: temporal
+objective: rectified_flow
+epochs: 30
+lr: 3.0e-4
+batch_size: 64
+num_workers: 4
+subset_frac: 1.0
+holdout_frac: 0.05
+holdout_seed: 12345          # match ship retrain so val set is comparable
+val_frac: 0.02               # fallback if holdout_frac=0
+tag: fusion_v1
+save_dir: latch_weights
+save_best_only: true
+latent_dir: /run/media/kim/Lehto/latents
+preload: ram
+
+# --- Model architecture (ship default) ---
+dim: 256
+depth: 6
+num_heads: 8
+t_injection: adaln_zero
+compile: true
+
+# --- FusionOpt hyperparameters (see spec §3) ---
+mona_alpha: 0.2              # curvature injection — seed-variance lever
+lambda_deriv: 1.0            # TemporalShapeLoss derivative weight
+lambda_multi: 0.5            # TemporalShapeLoss multi-scale weight
+curriculum_steps: 0          # 0 = no warmup on temporal terms
+
+# --- Logging ---
+wandb: true
+wandb_project: latch
+tensorboard: false

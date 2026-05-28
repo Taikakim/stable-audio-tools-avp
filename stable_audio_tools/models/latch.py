@@ -229,20 +229,30 @@ class LatCH(nn.Module):
 # ── Factory ────────────────────────────────────────────────────────────────
 
 def load_latch_from_checkpoint(path: str, device="cpu") -> LatCH:
-    """Load a LatCH model from a checkpoint, supporting two formats:
+    """Load a LatCH model from a checkpoint, supporting three formats:
 
     Legacy: a bare state_dict (flat dict of param-name -> tensor).
     New:    {"state_dict": <state_dict>, "feature_name": str,
              "feature_stats": dict, "target_kind_default": str, ...}
+    Fusion: same as New, plus "averaged_state_dict" — the Schedule-Free averaged
+            iterate x_t (the deployable model per the SF contract). Prefer it
+            over the live z_t in "state_dict" for inference.
 
     The returned model carries a ``model.metadata`` attribute with everything
-    in the checkpoint other than ``state_dict`` (empty dict for legacy files).
+    in the checkpoint other than the state-dict tensors (empty for legacy files).
     """
     raw = torch.load(path, map_location=device, weights_only=True)
 
     if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
-        state = raw["state_dict"]
-        metadata = {k: v for k, v in raw.items() if k != "state_dict"}
+        # FusionOpt heads: prefer averaged x_t over the live z_t for inference
+        if "averaged_state_dict" in raw and isinstance(raw["averaged_state_dict"], dict):
+            state = raw["averaged_state_dict"]
+        else:
+            state = raw["state_dict"]
+        metadata = {
+            k: v for k, v in raw.items()
+            if k not in ("state_dict", "averaged_state_dict")
+        }
     else:
         state = raw
         metadata = {}
