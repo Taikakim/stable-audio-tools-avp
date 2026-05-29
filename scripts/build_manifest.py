@@ -31,7 +31,8 @@ PARAM_GRAMMAR = [
     ("w", "weight", int),
     ("s", "start", lambda s: int(s) / 100.0),     # s33 => 0.33
     ("e", "end",   lambda s: int(s) / 100.0),     # e100 => 1.00
-    ("v", "value", lambda s: int(s)),             # v-15 => -15
+    # v-15 => -15, or v50k => 0.05 (the k suffix = divide by 1000 for sub-unit values).
+    ("v", "value", lambda s: int(s[:-1]) / 1000.0 if s.endswith("k") else int(s)),
 ]
 
 

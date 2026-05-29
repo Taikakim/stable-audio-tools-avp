@@ -52,24 +52,60 @@ CFG_SCALE = 7.0
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Target feature value for the rms_energy_bass head (dB).
-# -15 dB ≈ a punchy but not maxed bass energy.
+# Legacy single-feature TARGET_VALUE (kept for backward compat with Phase 1
+# filenames). New code uses TARGET_VALUES[feature] which is defined below.
 TARGET_VALUE = -15.0
 
-# Phase-1 variants: AdamW baseline + the SF-NorMuon production target.
-# Add more entries to expand (Full Fusion B2, Muon, MONA, etc.).
+# Variants — each entry is (name_for_filename_prefix, head_feature, ckpt_path).
+# Feature is needed because the prompt is fixed but the head's target value
+# scale changes per feature (rms_energy is dB, flatness is 0..1, etc.).
 VARIANTS = [
     {
         "name": "adamw_a1",
+        "feature": "rms_energy_bass",
         "ckpt": REPO / "latch_weights"
                      / "latch_rms_energy_bass_bakeoff_rms_energy_bass_A1_s1_best.pt",
     },
     {
         "name": "sfnormuon",
+        "feature": "rms_energy_bass",
         "ckpt": REPO / "latch_weights"
                      / "latch_rms_energy_bass_components_SFNorMuon_s1_best.pt",
     },
+    # Phase-2: production ship heads (§21 — SF-NorMuon + d256/dp4 + bf16)
+    {
+        "name": "ship_sfn_bass",
+        "feature": "rms_energy_bass",
+        "ckpt": REPO / "latch_weights"
+                     / "latch_rms_energy_bass_ship_rms_energy_bass_sfn_s1_best.pt",
+    },
+    {
+        "name": "ship_ff_bass",
+        "feature": "rms_energy_bass",
+        "ckpt": REPO / "latch_weights"
+                     / "latch_rms_energy_bass_ship_rms_energy_bass_fullfusion_s1_best.pt",
+    },
+    {
+        "name": "ship_sfn_flatness",
+        "feature": "spectral_flatness",
+        "ckpt": REPO / "latch_weights"
+                     / "latch_spectral_flatness_ship_spectral_flatness_sfn_s1_best.pt",
+    },
+    {
+        "name": "ship_sfn_flux",
+        "feature": "spectral_flux",
+        "ckpt": REPO / "latch_weights"
+                     / "latch_spectral_flux_ship_spectral_flux_sfn_s1_best.pt",
+    },
 ]
+
+# Default target value per feature (mid-range, sane for the prompt).
+# rms_energy_bass: dB scale [-60, 0]; flatness: [0, 1]; flux: feature units.
+TARGET_VALUES = {
+    "rms_energy_bass": -15.0,
+    "spectral_flatness": 0.05,        # mid-range flatness
+    "spectral_flux": 5.0,             # mid-range flux
+}
 
 # 8 hparam combos covering corners + window variations.
 # Each entry is (rho, mu, weight, start, end). gamma = 0.5 is shared.
@@ -89,14 +125,24 @@ N_ITER = 4
 
 def fname(variant: str, rho: int, mu: int, weight: int,
           start: float, end: float, value: float) -> str:
-    """Build the universal-naming-scheme filename for a render."""
+    """Build the universal-naming-scheme filename for a render.
+
+    Target value is encoded as int when whole, otherwise as int(value*1000)
+    with a "k" suffix (so 0.05 -> v50k, -15 -> v-15, 5 -> v5). This keeps
+    sortable alpha-order while preserving precision for sub-unit features.
+    """
     s = int(round(start * 100))
     e = int(round(end * 100))
+    if abs(value - round(value)) < 1e-9:
+        vtag = f"v{int(round(value))}"
+    else:
+        vtag = f"v{int(round(value * 1000))}k"
     return (f"{variant}__r{rho}_m{mu}_g{int(GAMMA*100):02d}_w{weight}"
-            f"_s{s:02d}_e{e:03d}_v{int(value)}.flac")
+            f"_s{s:02d}_e{e:03d}_{vtag}.flac")
 
 
-def render(model, ckpt_path: Path | None, hp: tuple | None, out_path: Path):
+def render(model, ckpt_path: Path | None, hp: tuple | None, out_path: Path,
+           target_value: float = TARGET_VALUE):
     """Generate a single clip. ckpt_path / hp None => unguided base."""
     sr = model_meta["sample_rate"]
     ss = model_meta["sample_size"]
@@ -110,7 +156,7 @@ def render(model, ckpt_path: Path | None, hp: tuple | None, out_path: Path):
         latch_configs = [{
             "model_path": str(ckpt_path),
             "kind": "constant",
-            "value": float(TARGET_VALUE),
+            "value": float(target_value),
             "weight": float(weight),
             "start_pct": float(start),
             "end_pct":   float(end),
@@ -171,18 +217,22 @@ if __name__ == "__main__":
     for variant in VARIANTS:
         if not variant["ckpt"].exists():
             print(f"[skip] {variant['name']}: checkpoint not found at {variant['ckpt']}")
+            idx += len(HPARAMS)
             continue
+        # Per-feature target value (falls back to legacy TARGET_VALUE if missing)
+        feature = variant.get("feature", "rms_energy_bass")
+        target_value = TARGET_VALUES.get(feature, TARGET_VALUE)
         for hp in HPARAMS:
             rho, mu, weight, start, end = hp
             out_path = OUT_DIR / fname(variant["name"], rho, mu, weight, start, end,
-                                       TARGET_VALUE)
+                                       target_value)
             if out_path.exists():
                 print(f"[skip] {out_path.name}")
                 idx += 1
                 continue
             print(f"[{idx}/{total}] {out_path.name}")
             try:
-                render(model, variant["ckpt"], hp, out_path)
+                render(model, variant["ckpt"], hp, out_path, target_value=target_value)
             except Exception as e:
                 print(f"  FAILED: {e}")
             idx += 1

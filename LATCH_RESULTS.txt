@@ -1192,3 +1192,74 @@ Net vs current ship A1 (d256/dp6 AdamW): -8% raw MAE on bass while
 running ~1.65x faster in optimiser-step and ~33% cheaper in inference.
 
 ================================================================================
+
+
+================================================================================
+21.  PRODUCTION SHIP RETRAIN — SF-NorMuon + bf16 + d256/dp4  (2026-05-29)
+================================================================================
+Validation of the production recipe at full subset, 30 epochs, seed 1, shared
+5% holdout (matches §18, §19). The bake-off conclusions (§20) made the recipe:
+
+  --optimizer fusion --components ns5,normuon,sf
+  --dim 256 --depth 4 --hot-dtype bf16 --compile --t-injection adaln_zero
+
+PILOT RETRAIN RESULTS (4 cells):
+
+   feature              recipe                   val_point_mae    Δ vs §18 A1
+   rms_energy_bass      SF-NorMuon                  3.0339          -12.5%
+   rms_energy_bass      Full Fusion (control)       3.0086          -13.2%
+   spectral_flatness    SF-NorMuon                  0.0450          -19.6%
+   spectral_flux        SF-NorMuon                 14.2560          -12.6%
+
+val_deriv_corr ("direction of events"):
+   rms_energy_bass      SFN  0.7534   FF  0.7585      (§19 B2 was 0.7412)
+   spectral_flatness    SFN  0.7883                   (§19 B2 was 0.7800)
+   spectral_flux        SFN  0.8487                   (§19 B2 was 0.8237)
+
+CELL TIMING (full subset, 30 ep, batch 64, d256/dp4, bf16, compile):
+
+   SF-NorMuon cells   ~34 min/head    45.1 it/s
+   Full Fusion cell   ~51 min/head    37.5 it/s    (-35% throughput vs SFN)
+
+The 45 it/s matches the AdamW ship retrain throughput from §18. The
+"3x slower" worry from §19 was specific to Full Fusion at d256/dp6;
+once SF-NorMuon + d256/dp4 + bf16 compose, the production target runs at
+AdamW speed AND delivers -12.5..-19.6% quality. Net win on both axes.
+
+ATTRIBUTION (this section vs prior data):
+  §18 ship A1 (AdamW d256/dp6 fp32):     reference baseline
+  §19 B2 pilot at subset 0.3:            -7..-11% (subset-limited)
+  §21 SF-NorMuon at full subset:         -12..-20%  (full-data convergence)
+
+The full-subset numbers are noticeably better than the bake-off pilot
+suggested, because the bake-off was at subset 0.3 / 20 epochs. The
+production recipe + full data is the real picture: every pilot head
+posts double-digit raw-MAE improvement.
+
+Full Fusion vs SF-NorMuon attribution (bass head, identical scale):
+   metric              SF-NorMuon       Full Fusion        Δ
+   val_point_mae       3.0339           3.0086             -0.8%
+   val_deriv_corr      0.7534           0.7585             +0.005
+   wall-clock          34 min           51 min             +50% (Shampoo+MONA cost)
+
+So the extra Shampoo + MONA cost 50% wall-clock for ~1% quality. The
+SF-NorMuon recipe is confirmed as the production target. Full Fusion
+stays available via --components ns5,normuon,sf,mona,shampoo for
+heads where the extra 1% matters.
+
+CHECKPOINTS:
+   latch_weights/latch_rms_energy_bass_ship_rms_energy_bass_sfn_s1_best.pt
+   latch_weights/latch_spectral_flatness_ship_spectral_flatness_sfn_s1_best.pt
+   latch_weights/latch_spectral_flux_ship_spectral_flux_sfn_s1_best.pt
+   latch_weights/latch_rms_energy_bass_ship_rms_energy_bass_fullfusion_s1_best.pt
+
+Each saves both model_state_dict (live z_t) and averaged_state_dict (SF
+average x_t). Inference auto-picks the averaged one. Ready to deploy.
+
+NEXT STEPS:
+  - Extend ship retrain to the remaining 7 trained heads (rms_body/mid/air,
+    spectral_skewness/kurtosis, onsets_activations, hpcp).
+  - Audition renders for these 4 new heads via runder_audition.py +
+    TimeConditioningCache (added at §20D-aftermath); UI auto-picks them up.
+
+================================================================================
