@@ -111,9 +111,15 @@ class FusionOpt(Optimizer):
         # Weight decay (set per-group via param_groups; these are fallbacks)
         weight_decay: float = 0.0,
         # Hot-path dtype: cast preconditioned momentum + NS5 inputs to this dtype
-        # (kept FP32 by default for safety; FP16 on RDNA4 if profiling shows need)
+        # (kept FP32 by default for safety; FP16 on RDNA4 if profiling shows need).
+        # Valid: "fp32", "fp16", "bf16".
         hot_dtype: str = "fp32",
         warmup_steps: int = 0,
+        # FP32 audit: every N steps, recompute NS5 in FP32 alongside the hot_dtype
+        # path and log relative error stats. 0 = disabled. Useful for verifying that
+        # fp16/bf16 quantisation isn't quietly destabilising the spectral updates.
+        # Cost: roughly 2x optimizer step on audit steps only (~0.5% if N=200).
+        fp32_audit_period: int = 0,
         # Component flags — controls which mechanisms run in the spectral path.
         # Use this for the per-component ablation (one optimiser at a time).
         # Default = full Fusion (everything on). Valid components:
@@ -142,6 +148,7 @@ class FusionOpt(Optimizer):
             beta1=beta1, beta2=beta2, eps=eps,
             weight_decay=weight_decay,
             hot_dtype=hot_dtype, warmup_steps=warmup_steps,
+            fp32_audit_period=int(fp32_audit_period),
         )
         super().__init__(params, defaults)
 
@@ -153,6 +160,9 @@ class FusionOpt(Optimizer):
         # On-device EMAs; lazily created on first step()
         self._loss_ema: torch.Tensor | None = None
         self._gnorm_ema: torch.Tensor | None = None
+        # FP32 audit records; trimmed to recent N to bound memory
+        self._audit_stats: list[dict] = []
+        self._audit_keep = 200
 
         # Sanity: groups must declare group_type
         for g in self.param_groups:
@@ -403,6 +413,24 @@ class FusionOpt(Optimizer):
             # 5. Muon NS5 spectral normalisation (optional)
             if "ns5" in self._components:
                 U = newton_schulz_5(m_pre).float()
+                # FP32 audit (optional): silently re-run in FP32 and record the
+                # relative error; doesn't affect the actual update.
+                audit_period = group.get("fp32_audit_period", 0)
+                if (audit_period > 0 and hot_dtype != torch.float32 and
+                        self._step_count > 0 and self._step_count % audit_period == 0):
+                    with torch.no_grad():
+                        m_pre_fp32 = m_pre.float()
+                        U_fp32 = newton_schulz_5(m_pre_fp32)
+                    diff = (U - U_fp32).abs()
+                    denom = U_fp32.abs().clamp_min(1e-12)
+                    rel = (diff / denom).flatten()
+                    self._audit_stats.append({
+                        "step":  self._step_count,
+                        "shape": tuple(U.shape),
+                        "rel_mean": float(rel.mean().detach()),
+                        "rel_max":  float(rel.max().detach()),
+                        "abs_max":  float(diff.max().detach()),
+                    })
                 out_dim, in_dim = U.shape
                 U.mul_((max(1.0, out_dim / in_dim)) ** 0.5)  # aspect-ratio scale
             else:
@@ -493,4 +521,16 @@ class FusionOpt(Optimizer):
             out["fusion/gnorm_ema"] = float(self._gnorm_ema.detach().cpu())
         if self._loss_ema is not None:
             out["fusion/loss_ema"] = float(self._loss_ema.detach().cpu())
+        # FP32 audit roll-ups (latest sample) — useful for catching quantisation drift
+        if self._audit_stats:
+            # Keep only the recent N records
+            if len(self._audit_stats) > self._audit_keep:
+                self._audit_stats = self._audit_stats[-self._audit_keep:]
+            latest = self._audit_stats[-min(32, len(self._audit_stats)):]
+            rel_means = [r["rel_mean"] for r in latest]
+            rel_maxs  = [r["rel_max"]  for r in latest]
+            abs_maxs  = [r["abs_max"]  for r in latest]
+            out["fusion/audit_rel_mean_avg"] = sum(rel_means) / len(rel_means)
+            out["fusion/audit_rel_max_p99"] = max(rel_maxs)
+            out["fusion/audit_abs_max_p99"] = max(abs_maxs)
         return out

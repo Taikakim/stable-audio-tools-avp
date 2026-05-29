@@ -187,6 +187,7 @@ def train(
     reset_optimizer=False,
     hot_dtype="fp32",
     components=None,
+    fp32_audit_period=0,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
@@ -351,6 +352,7 @@ def train(
             warmup_steps=warmup,
             hot_dtype=hot_dtype,
             components=comps_set,
+            fp32_audit_period=int(fp32_audit_period or 0),
         )
         # SF .train()/.eval() toggle only when the SF averaging component is active
         _is_sf = optimizer.uses_sf_averaging
@@ -839,6 +841,12 @@ if __name__ == "__main__":
                              "'shampoo' for KL-Shampoo only, 'sf' for ScheduleFree+, "
                              "'ns5,normuon,sf' for SF-NorMuon. See LATCH_RESULTS.txt §20 "
                              "for the per-component ablation results.")
+    parser.add_argument("--fp32-audit-period", type=int, default=None,
+                        help="FusionOpt: every N steps, recompute NS5 in FP32 alongside "
+                             "the hot-dtype path and log relative-error stats (rel_mean, "
+                             "rel_max, abs_max). 0 = disabled. Useful with --hot-dtype "
+                             "fp16/bf16 to verify quantisation isn't destabilising. Cost: "
+                             "~0.5%% at N=200.")
     parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
@@ -911,4 +919,5 @@ if __name__ == "__main__":
         reset_optimizer=args.reset_optimizer or bool(ycfg.get("reset_optimizer", False)),
         hot_dtype=pick(args.hot_dtype, "hot_dtype", "fp32"),
         components=pick(args.components, "components", None),
+        fp32_audit_period=pick(args.fp32_audit_period, "fp32_audit_period", 0),
     )
