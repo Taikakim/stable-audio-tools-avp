@@ -205,6 +205,7 @@ def generate_diffusion_cond(
         # ── LatCH-guided generation ───────────────────────────────────
         from ..models.latch import load_latch_from_checkpoint
         from .latch_targets import build_target
+        from .time_cache import TimeConditioningCache
 
         if model.pretransform is None:
             raise ValueError("LatCH guidance requires a latent pretransform")
@@ -214,6 +215,15 @@ def generate_diffusion_cond(
         for cfg in latch_configs:
             print(f"[LatCH] Loading {cfg['model_path']}")
             latch = load_latch_from_checkpoint(cfg["model_path"], device=str(device))
+            # Wire in the TimeConditioningCache: warm for the sampler's step
+            # schedule + t=0 (for the mean-guidance z_0|t loop). Heads with
+            # t_injection != "adaln_zero" benefit less but still cache t_emb.
+            cache = TimeConditioningCache(latch, device=device)
+            try:
+                cache.warm_for_schedule(int(steps), include_zero=True)
+                latch.attach_time_cache(cache)
+            except Exception as e:
+                print(f"[LatCH]   time-cache warm failed ({e}); falling back to live calc")
             head_sched = latch.metadata.get("noise_schedule")
             if head_sched is not None and head_sched != diff_objective:
                 print(f"[LatCH]   WARNING: head was trained for noise_schedule="
@@ -231,6 +241,12 @@ def generate_diffusion_cond(
                 device=device,
                 dtype=torch.float32,
             )
+            # If the head was trained on standardized targets, the head outputs
+            # standardized values — standardize the (raw-unit) target to match.
+            if latch.metadata.get("standardized"):
+                _m = float(latch.metadata.get("std_mean", 0.0))
+                _s = float(latch.metadata.get("std_std", 1.0)) or 1.0
+                target = (target - _m) / _s
             print(f"[LatCH]   kind={kind}  value={value}  target.shape={tuple(target.shape)}  "
                   f"target.range=[{target.min().item():.4f}, {target.max().item():.4f}]")
             latch_guides.append({

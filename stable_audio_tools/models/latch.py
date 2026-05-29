@@ -114,8 +114,17 @@ class LatCHBlockAdaLN(nn.Module):
         nn.init.zeros_(self.adaLN_mod[-1].weight)
         nn.init.zeros_(self.adaLN_mod[-1].bias)
 
-    def forward(self, x, t_emb, cos, sin):
-        g1, b1, a1, g2, b2, a2 = self.adaLN_mod(t_emb).chunk(6, dim=-1)
+    def forward(self, x, t_emb, cos, sin, mods=None):
+        """Optionally take precomputed modulators from a TimeConditioningCache.
+
+        mods, if given, is a 6-tuple of tensors (g1, b1, a1, g2, b2, a2). Each
+        tensor's leading dim is broadcast-compatible with x's batch (cache stores
+        them as (1, dim); PyTorch broadcasting handles the expansion).
+        """
+        if mods is None:
+            g1, b1, a1, g2, b2, a2 = self.adaLN_mod(t_emb).chunk(6, dim=-1)
+        else:
+            g1, b1, a1, g2, b2, a2 = mods
         n1 = self.norm1(x) * (1 + g1.unsqueeze(1)) + b1.unsqueeze(1)
         x = x + a1.unsqueeze(1) * self.attn(n1, cos, sin)
         n2 = self.norm2(x) * (1 + g2.unsqueeze(1)) + b2.unsqueeze(1)
@@ -193,11 +202,34 @@ class LatCH(nn.Module):
         x : [B, in_channels, T]  (noisy latents)
         t : [B]                  (timesteps 0..1)
         Returns : [B, out_channels, T]
+
+        If self._time_cache is set (TimeConditioningCache instance) AND t is
+        uniform across the batch AND the value is cached, t_emb and per-block
+        adaLN-zero modulators are looked up rather than recomputed. Falls back
+        to live calc otherwise — no quality regression, just no speed-up on
+        the un-cached path.
         """
         B, C, T_seq = x.shape
         x = x.transpose(1, 2)                       # → [B, T, C]
         x = self.latent_proj(x)
-        t_emb = self.t_embedder(t)                   # [B, dim]
+
+        # ── Try the time-conditioning cache, if attached ────────────────────
+        # The sampler always passes a uniform t (torch.full((B,), value)) so
+        # we can cache by scalar value. Multi-value t batches fall through to
+        # the live path.
+        cache_entry = None
+        cache = getattr(self, "_time_cache", None)
+        if cache is not None and t.numel() > 0:
+            t_first = t.flatten()[0]
+            if t.numel() == 1 or torch.all(t == t_first):
+                cache_entry = cache.get(float(t_first.item()))
+
+        if cache_entry is not None:
+            t_emb = cache_entry["t_emb"]            # (1, dim) — broadcasts to (B, ...)
+            block_mods_cached = cache_entry["modulators"]
+        else:
+            t_emb = self.t_embedder(t)              # (B, dim)
+            block_mods_cached = [None] * len(self.blocks)
 
         if self.t_injection == "film":
             scale, shift = self.t_film(t_emb).chunk(2, dim=-1)
@@ -210,8 +242,8 @@ class LatCH(nn.Module):
         elif self.t_injection == "adaln_zero":
             pos = torch.arange(T_seq, device=x.device).float()
             cos, sin = self.rotary_emb(pos)
-            for block in self.blocks:
-                x = block(x, t_emb, cos, sin)
+            for i, block in enumerate(self.blocks):
+                x = block(x, t_emb, cos, sin, mods=block_mods_cached[i])
             x = self.norm_final(x)
         else:  # concat (legacy)
             x = torch.cat([t_emb.unsqueeze(1), x], dim=1)
@@ -224,6 +256,16 @@ class LatCH(nn.Module):
 
         out = self.out_proj(x)                        # [B, T, out_channels]
         return out.transpose(1, 2)                    # [B, out_channels, T]
+
+    # ── Time-conditioning cache: lazy wiring ────────────────────────────────
+    def attach_time_cache(self, cache) -> None:
+        """Attach a TimeConditioningCache. None or absent => live calc only."""
+        self._time_cache = cache
+
+    def detach_time_cache(self) -> None:
+        """Remove the attached cache and revert to live calc."""
+        if hasattr(self, "_time_cache"):
+            self._time_cache = None
 
 
 # ── Factory ────────────────────────────────────────────────────────────────
