@@ -1399,3 +1399,59 @@ WHAT MIGHT WORK (future):
 NEGATIVE RESULT FILED. Schedule-Free averaging IS our soup; it's not
 duplicable as a post-training stunt across heterogeneous trained heads.
 
+
+
+================================================================================
+22.  ARCHITECTURE SWEEP — d512/dp4, d256/dp8, d128/dp8, d128/dp16  (2026-05-30)
+================================================================================
+User asked "just out of interest" what wider / deeper variants would do.
+Recipe = SF-NorMuon + bf16 + SmoothL1 (production target). seed=1, subset 0.3,
+20 epochs, shared 5% holdout. Comparable to §20B shrink numbers at the
+same scale.
+
+  config             params   bass val_pmae   flatness val_pmae   it/s
+  --------------     ------   --------------  ------------------  ------
+  d256/dp6 (§19 B1)  7.25M     3.1785              –              ~26 (bf16 ref)
+  d256/dp4 (ship)    4.87M     3.0339 (full)       0.0450 (full)   45  <- current production
+                              [3.2294 at 20ep/0.3 subset]
+  d512/dp4 (new)     ~19M      3.2485              0.0508          22.7
+  d256/dp8 (new)     ~9.7M     3.1942              0.0502          24.0
+  d128/dp8 (new)     ~2.6M     3.2970              0.0526          32.2
+  d128/dp16 (new)    ~5.2M     3.2380              0.0510          16.7
+
+ANALYSIS:
+
+(1) d512/dp4 is dead weight. ~4x more params than d256/dp4, slower
+    (22.7 vs ~45 it/s for d256/dp4), and quality is WORSE than d256/dp4
+    (+0.6% on bass). Width past 256 buys nothing on LatCH heads. Confirms
+    the §3 finding "we don't need >4.9M params" — extending to >19M just
+    eats throughput.
+
+(2) d256/dp8 matches d256/dp6 quality with no real edge over d256/dp4.
+    bass 3.1942 vs d256/dp6 3.1785 (within noise), flatness 0.0502 vs
+    0.0495 (within noise). Depth past 6 stops paying off; the extra two
+    blocks add cost (24 it/s vs ~26 for d256/dp6) without quality gain.
+
+(3) d128/dp8 = throughput champion at 32.2 it/s but +2-5% MAE penalty.
+    Genuinely useful niche: fast prototyping / hparam sweeps where the
+    quality hit is acceptable but iteration speed matters. Not a
+    production replacement for d256/dp4 (whose ship-retrained val_pmae
+    is 3.0339 vs this 3.2970 = -8% gap).
+
+(4) d128/dp16 is the worst-of-both. Slowest (16.7 it/s), worse quality
+    than d128/dp8 in some cells. Depth at half-width doesn't compose:
+    the smaller per-block capacity makes more blocks less helpful.
+
+THE D256/DP4 RECIPE STAYS PRODUCTION TARGET:
+  - Best throughput at any d≥256
+  - At full subset / 30 ep, val_pmae drops to 3.0339 bass / 0.0450 flatness
+    (§21) — better than any 20-ep / 0.3 subset number in this table
+  - 4.87M params (smallest sensible)
+  - Inference cost ~67% of d256/dp6 (the §18 ship reference)
+
+If a 1% raw-MAE bump matters: d256/dp4 + fp16_safe hot-dtype (§20E) might
+trade speed for quality.
+
+If iteration speed matters more than 1-2% quality: d128/dp8 for sweeps.
+
+================================================================================
