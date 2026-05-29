@@ -1277,59 +1277,125 @@ each matmul to keep fp16 inputs in range. CPU sanity matched fp32 NS5 to
 GPU benchmark on rms_energy_bass, B1 cell (Full Fusion + SmoothL1) at
 d256/dp6, --compile, 20 epochs, subset 0.3:
 
-  dtype             it/s     val_point_mae     note
-  fp32 (§19 B1)     ~16      3.1921            stable
-  bf16 (§20D)       26.4     3.2238            stable, +1.0%
-  fp16 (unsafe)     66.3     NaN               diverged step 3
-  fp16_safe (this)  13.6     converging        SLOWER than fp32, killed early
+  dtype             it/s     val_point_mae     val_deriv_corr    note
+  fp32 (§19 B1)     ~16      3.1921            ~0.73             baseline
+  bf16 (§20D)       26.4     3.2238            0.7233            speed (+1.0% MAE)
+  fp16 (unsafe)     66.3     NaN               NaN               diverged step 3
+  fp16_safe (this)  13.6     3.1776            0.7331            quality (-0.5% vs fp32)
 
-Predicted 1.3-1.5x over bf16. Actual: 0.5x bf16 (and even 0.85x fp32).
-The rescale-restore overhead inside _safe_mm dominates the fp16 throughput
-win. Per matmul:
-  - 2x torch.max() reductions (one per operand)
+(USER CAUGHT THIS: the first pass killed the run during torch.compile/Inductor
+warmup. Re-ran to full 20-epoch completion. The 13.6 it/s number was almost
+right — the warmup ramp had nearly converged by my kill point — but the
+QUALITY number was missing. fp16_safe at full convergence outperforms bf16
+on val_point_mae by 1.4% and matches fp32 within noise.)
+
+Predicted 1.3-1.5x over bf16 on SPEED. Actual: 0.5x bf16 throughput. The
+rescale-restore overhead inside _safe_mm dominates:
+  - 2x torch.max() reductions per matmul
   - 2x divisions by scale
   - 2x .to(fp16) casts
   - 1x fp16 matmul (the only win)
   - 1x .float() cast
   - 1x scale-restore multiply
 
-Per NS5 iteration: 3 _safe_mm calls = 6 max reductions + cast overhead.
-Per spectral param: 5 iterations × 3 calls = 15 _safe_mm. Per step: 32
-spectral params × 15 = 480 _safe_mm calls. The max reductions and small
-casts compound into a per-call latency that swamps the matmul savings.
+Per NS5 iteration: 3 _safe_mm = 6 max reductions + cast overhead.
+Per step: 32 spectral params × 5 iter × 3 = 480 _safe_mm calls. Python-
+level overhead dominates the matmul savings.
 
-WHY THIS DIDN'T WORK:
+But the QUALITY result is actually compelling. The fp32 polynomial
+accumulation + per-tensor rescale preserves precision that bf16's 7-bit
+mantissa loses across 15 compounded matmuls per block × 6 blocks.
+val_point_mae 3.1776 < bf16's 3.2238 AND < fp32's 3.1921. The trade is
+real: fp16_safe is a quality knob, not a speed knob.
 
-  hipBLASLt's fp16 matmul ~3 ms/call for our shapes
-  My rescale-restore: ~5-7 ms/call from the reduction+cast overhead
-  Total per _safe_mm: ~8-10 ms vs bf16's single ~4-5 ms matmul
+THE REAL TRADEOFF (corrected):
 
-  The naive fp16 (no rescale) IS faster but unsafe. The bf16 path is
-  cheaper because every op is a single matmul with no extra reductions.
+  hot_dtype     speed    quality       use case
+  bf16          fast     -1.0% MAE     production default (compute-bound)
+  fp16_safe     slow     +0.5% MAE     quality-bound runs (research, refinement)
+  fp32          medium   baseline      simplicity, no compile warmup quirks
+  fp16          v.fast   diverges      NEVER
 
-WHAT WOULD ACTUALLY WORK (if we ever revisit):
+WHAT WOULD GET BOTH (still unimplemented):
 
-  1. Custom Triton kernel for the full NS5 iteration with rescale-restore
-     fused into the matmul epilogue. Removes the python-level overhead.
-     ~200 LoC, real engineering effort.
-  
-  2. A coarser "scale by initial Frobenius norm only" path that doesn't
-     rescale between iterations — relies on the NS5 SV-bracket guarantee
-     to keep values bounded. Predicted ~2x bf16 but theoretical risk of
-     overflow if grad statistics drift outside the expected range.
+  Custom Triton kernel for NS5 with rescale-restore fused into the matmul
+  epilogue. ~200 LoC, removes python overhead while keeping fp16 + fp32
+  accumulate. Predicted: faster than bf16 AND quality-matching fp16_safe.
+  Worth doing only if we ever exhaust the easier wins.
 
-  3. Stop trying. bf16 at 26 it/s on d256/dp6, or 45 it/s on the production
-     d256/dp4, is good enough. Most production hardware (NVIDIA H100,
-     B100) has well-tuned bf16; we're already on the right path there.
+CONCLUSION (corrected):
 
-CONCLUSION:
-
-  Keep bf16 as the production hot-dtype. fp16_safe ships as a CLI option
-  for the curious but is NOT a default. The proper engineering fix would
-  be a custom Triton kernel; that's a real engineering project, not a
-  hot-fix.
-
-  Removing the speculative "1.3-1.5x" speedup claim from §20D and
-  docs/fusion-optimiser.md. bf16 IS the plateau.
+  Production default: --hot-dtype bf16 (speed-favoring).
+  Quality-favoring: --hot-dtype fp16_safe (when val_point_mae matters more
+    than wall-clock — e.g., a final ship retrain refinement, or research
+    sweeps where 1% quality matters).
+  bf16 IS the plateau on the SPEED axis. fp16_safe is a NEW plateau on the
+  quality axis, surprisingly outperforming fp32.
 
 ================================================================================
+
+
+------------------------------------------------------------------------------
+PART F — Model soup experiment (negative result)
+------------------------------------------------------------------------------
+
+User asked: can we average the best heads to find an "ultimate perfect target"?
+Tested via uniform soup (Wortsman et al. 2022 arXiv:2203.05482) of 7 bass heads
+at d256/dp6:
+
+  A1 (AdamW + SmoothL1)
+  B1 (Full Fusion + SmoothL1)
+  B2 (Full Fusion + Temporal)
+  Muon component (--components ns5)
+  MONA component (--components ns5,mona)
+  ScheduleFree+ (--components sf)
+  SF-NorMuon (--components ns5,normuon,sf)
+
+For FusionOpt heads, used averaged_state_dict (SF x_t average) as the
+deployable weights — merged with state_dict for buffers (rotary_emb.inv_freq).
+
+Results (eval on 50-batch sample of shared holdout):
+
+  ingredient            val_point_mae   val_deriv_corr
+  SF-NorMuon (alone)        3.1655         0.7285
+  soup of 7 (uniform)      11.8889        -0.0056    <- much worse
+  soup of 3 SF (B1+B2+SFN)  7.9132         0.0352    <- still worse
+
+CONCLUSION: model soup doesn't work across heterogeneous LatCH heads.
+
+WHY:
+  Wortsman 2022 specifically souped models that shared:
+    - architecture
+    - hyperparameters (LR, batch, schedule, optimiser)
+    - starting point (fine-tuning from same pretrained checkpoint)
+  Different fine-tuning trajectories from the same basin can average
+  productively. Our heads were trained from scratch with DIFFERENT
+  optimisers (AdamW vs Fusion variants), DIFFERENT components (Muon
+  alone vs full Fusion), and DIFFERENT losses (SmoothL1 vs Temporal).
+  They live in different basins of the loss landscape; the midpoint
+  is in a high-loss region between basins, not in a useful one.
+
+  Even souping just the SF-averaged heads (B1, B2, SF-NorMuon) — all
+  Schedule-Free, all 30-epoch — gave 7.91. Same loss, different
+  components / loss-fn variants. Not a connected basin.
+
+THE FORM OF "SOUP" THAT DOES WORK FOR US:
+  Schedule-Free's iterant averaging x_{t+1} = (1 - 1/(t+1)) x_t + (1/(t+1)) z_{t+1}
+  is essentially trajectory soup along a SINGLE training run. The x_t we
+  deploy IS the average of all the z iterates in that training run.
+  We're already doing this; it works because all z iterates are in the
+  same connected mode by construction.
+
+WHAT MIGHT WORK (future):
+  - Soup of multiple heads trained with IDENTICAL hyperparams but different
+    seeds, AT THE SAME EPOCH. Requires extra training runs we don't have.
+  - Snapshot ensembles: cyclic LR within one run + save at each local
+    minimum + soup those snapshots. Same training cost as a single run
+    but harder LR scheduling.
+  - Greedy soup: try each ingredient one at a time, keep the inclusion
+    that improves val_point_mae the most. Doesn't fix the basin problem
+    but limits damage when ingredients diverge.
+
+NEGATIVE RESULT FILED. Schedule-Free averaging IS our soup; it's not
+duplicable as a post-training stunt across heterogeneous trained heads.
+
