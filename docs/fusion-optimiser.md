@@ -174,7 +174,7 @@ Re-ran B2 (Fusion + Temporal) at three smaller configurations on bass and flatne
 
 ## What to ship
 
-**SF-NorMuon at dim=256, depth=4.**
+**SF-NorMuon at dim=256, depth=4 with `--hot-dtype bf16`.**
 
 ```bash
 python scripts/train_latch.py --config latch_train.yaml \
@@ -182,11 +182,13 @@ python scripts/train_latch.py --config latch_train.yaml \
   --optimizer fusion --loss smoothl1 \
   --components ns5,normuon,sf \
   --dim 256 --depth 4 --num-heads 8 \
-  --hot-dtype fp16 \
+  --hot-dtype bf16 \
   --epochs 30 --batch-size 64 --lr 3e-4 \
   --compile --t-injection adaln_zero \
   --seed 1 --save-best-only
 ```
+
+> **Important**: `--hot-dtype fp16` looked promising in the microbench (2.65× speedup) but **diverges to NaN after ~2 steps** in practice. The NS5 quintic's iterated `X (XᵀX)²` overflows fp16's 65 504 max during the first optimiser step on LatCH's 1024×256 mats. bf16 has fp32-equivalent exponent range (8-bit), runs stably, costs 1 % on val_point_mae, and is ~1.65× faster than fp32 (limited by un-tuned hipBLASLt kernels — a one-time bf16 TunableOp calibration would close the gap to ~3×). See LATCH_RESULTS.txt §20 Part D.
 
 Why this combination:
 - **SF-NorMuon over Full Fusion**: captures 95 % of the quality lift with less implementation surface (no KL-Shampoo eigendecomp, no MONA buffers). The +0.4 % bump from Full Fusion isn't worth the extra hyperparameters and per-step overhead.
