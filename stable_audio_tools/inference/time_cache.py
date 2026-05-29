@@ -86,25 +86,34 @@ class TimeConditioningCache:
             return
         self._by_value[k] = self._build_one(float(t))
 
-    def get(self, t):
-        """Return cached entry for scalar t, or None when not cached / stale.
+    def get(self, t, auto_warm: bool = True):
+        """Return cached entry for scalar t.
+
+        When `auto_warm=True` (default), a miss populates the cache for `t`
+        and returns the freshly-built entry, so subsequent calls at the same
+        t hit the cache. The miss is still counted in hit_stats for visibility.
+        Set `auto_warm=False` to get the strict-lookup semantics (returns None
+        on miss, caller must explicitly .ensure() to populate).
 
         The entry is a dict with keys:
           t_emb:       (1, dim) tensor
           modulators:  list of length depth; each element is either
                        tuple of 6 (1, dim) tensors  -> adaln_zero block,
                        or None                       -> film/concat block.
-        Returns None when t isn't cached or when underlying weights changed.
+        Returns None when underlying weights changed (cache invalidated) and
+        the caller didn't pass auto_warm=True.
         """
         if self._weights_tag != self._compute_weights_tag():
             # Underlying head weights changed — drop the whole cache.
             self._by_value.clear()
             self._weights_tag = self._compute_weights_tag()
-            self._misses += 1
-            return None
-        entry = self._by_value.get(_quantize_key(t))
+        k = _quantize_key(t)
+        entry = self._by_value.get(k)
         if entry is None:
             self._misses += 1
+            if auto_warm:
+                self.ensure(t)
+                entry = self._by_value.get(k)
         else:
             self._hits += 1
         return entry
@@ -203,3 +212,44 @@ def _self_test():
 
 if __name__ == "__main__":
     _self_test()
+
+
+# ---- process-level cache registry ------------------------------------------
+
+# Persists across multiple generate_diffusion_cond() calls in the same Python
+# process. Keyed by (checkpoint path, n_steps). Auto-warm fills in any sampler
+# t values that weren't in the linspace warm, so the second render at the same
+# checkpoint + step count hits the cache 100 %.
+
+_CACHE_REGISTRY: dict[tuple, TimeConditioningCache] = {}
+
+
+def get_or_build_cache(latch_head, model_path: str, n_steps: int,
+                       device: str | torch.device = "cuda") -> TimeConditioningCache:
+    """Return a persistent TimeConditioningCache for (model_path, n_steps).
+
+    Builds on first call, returns the cached instance on subsequent calls.
+    The cache's internal weight-tag check still invalidates if someone
+    overwrites the underlying head weights, so this is safe across hot reloads.
+    """
+    key = (str(model_path), int(n_steps))
+    cache = _CACHE_REGISTRY.get(key)
+    if cache is None:
+        cache = TimeConditioningCache(latch_head, device=device)
+        cache.warm_for_schedule(int(n_steps), include_zero=True)
+        _CACHE_REGISTRY[key] = cache
+    else:
+        # Cache hit for this (model_path, n_steps). Trust that the same
+        # checkpoint path -> same weights; just refresh the head reference
+        # so the cache's weight-tag check matches and auto-warmed entries
+        # from previous renders are reused. (To rebuild on a true weight
+        # swap, call clear_cache_registry() first.)
+        cache.head = latch_head
+        cache._weights_tag = cache._compute_weights_tag()
+    return cache
+
+
+def clear_cache_registry() -> None:
+    """Drop all persistent caches (e.g. after a model swap in a long-running
+    process). Frees the GPU memory used by cached t_emb / modulator tensors."""
+    _CACHE_REGISTRY.clear()

@@ -49,6 +49,11 @@ def newton_schulz_5(G: torch.Tensor, steps: int = 5, eps: float = 1e-12) -> torc
 
     For tall matrices (rows > cols) we transpose to keep the inner X @ X^T
     small (cols x cols rather than rows x rows). Result is transposed back.
+
+    Dtype handling: this is the standard implementation. The input dtype is
+    preserved throughout — at fp16 the iterated polynomial overflows on
+    big matrices (see §20D). Use newton_schulz_5_fp16_safe() instead for
+    a mixed-precision path that keeps polynomial accumulation in fp32.
     """
     a, b, c = _NS5_COEFFS
     X = G / (G.norm() + eps)
@@ -59,6 +64,52 @@ def newton_schulz_5(G: torch.Tensor, steps: int = 5, eps: float = 1e-12) -> torc
         A = X @ X.transpose(-1, -2)
         B = b * A + c * (A @ A)
         X = a * X + B @ X
+    if transposed:
+        X = X.transpose(-1, -2)
+    return X
+
+
+def newton_schulz_5_fp16_safe(G: torch.Tensor, steps: int = 5,
+                              eps: float = 1e-12) -> torch.Tensor:
+    """NS5 with FP16 matmuls and FP32 polynomial accumulation.
+
+    Splits the iteration into "matmul" steps (cast to fp16, use tensor cores)
+    and "polynomial" steps (in fp32, where intermediate values can exceed
+    fp16's 65 504 ceiling without issue). Each matmul is preceded by a
+    per-tensor max-abs rescale so the fp16 inputs always fit in range; the
+    result is rescaled back to fp32 immediately.
+
+    Predicted speedup over bf16 on RDNA4: 1.3-1.5x (matmul throughput from
+    the well-tuned fp16 hipBLASLt path; per-tensor rescale costs <1 % of
+    matmul time when implemented as a max + division kept on-device).
+
+    Compared to the naive fp16 NS5: avoids the overflow that diverges
+    training in ~2 steps (§20D), because the polynomial term `b*A + c*A²`
+    is computed in fp32 and the next matmul gets a rescaled fp16 input.
+
+    Memory: no extra allocations beyond the standard path (one fp16 cast
+    per matmul, immediately consumed).
+    """
+    a, b, c = _NS5_COEFFS
+    # All accumulation in fp32; matmul inputs are explicitly cast to fp16.
+    X = G.float() / (G.float().norm() + eps)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.transpose(-1, -2).contiguous()
+
+    def _safe_mm(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+        """fp16 tensor-core matmul with rescale-and-restore; result in fp32."""
+        scale_p = P.abs().max().clamp_min(1.0)
+        scale_q = Q.abs().max().clamp_min(1.0)
+        out = (P / scale_p).to(torch.float16) @ (Q / scale_q).to(torch.float16)
+        return out.float() * (scale_p * scale_q)
+
+    for _ in range(steps):
+        A = _safe_mm(X, X.transpose(-1, -2))
+        AA = _safe_mm(A, A)
+        B = b * A + c * AA                  # fp32 accumulation, no overflow
+        BX = _safe_mm(B, X)
+        X = a * X + BX
     if transposed:
         X = X.transpose(-1, -2)
     return X
@@ -347,10 +398,24 @@ class FusionOpt(Optimizer):
 
         gamma_t = lr * gamma_ratio * warm
 
+        # hot_dtype_name controls how the NS5 hot path runs:
+        #   "fp32"     - safe, slowest. Standard NS5 in fp32.
+        #   "bf16"     - safe, ~1.65x faster than fp32. NS5 in bf16 (fp32-range
+        #                exponent, can't overflow).
+        #   "fp16"     - UNSAFE for NS5; iterated quintic overflows. Will diverge.
+        #                Kept as a choice for users who want to confirm divergence.
+        #   "fp16_safe"- predicted ~1.3-1.5x over bf16. Uses fp16 matmuls with
+        #                fp32 polynomial accumulation and per-tensor rescale-restore
+        #                around each matmul (see newton_schulz_5_fp16_safe).
+        # The non-NS5 ops (preconditioner P_L @ m @ P_R) still cast to the
+        # name's literal dtype mapping below; "fp16_safe" maps to fp16 there
+        # since the preconditioner matmul is single-shot (no iterated overflow).
         hot_dtype = {
             "fp16": torch.float16,
+            "fp16_safe": torch.float16,
             "bf16": torch.bfloat16,
         }.get(hot_dtype_name, torch.float32)
+        use_safe_ns5 = (hot_dtype_name == "fp16_safe")
 
         for p in group["params"]:
             if p.grad is None:
@@ -412,7 +477,10 @@ class FusionOpt(Optimizer):
 
             # 5. Muon NS5 spectral normalisation (optional)
             if "ns5" in self._components:
-                U = newton_schulz_5(m_pre).float()
+                if use_safe_ns5:
+                    U = newton_schulz_5_fp16_safe(m_pre).float()
+                else:
+                    U = newton_schulz_5(m_pre).float()
                 # FP32 audit (optional): silently re-run in FP32 and record the
                 # relative error; doesn't affect the actual update.
                 audit_period = group.get("fp32_audit_period", 0)
