@@ -1,0 +1,45 @@
+# Production training config — SF-NorMuon + bf16 + d256/dp4.
+#
+# This is the recipe the per-component bake-off (§20C) + shrink experiment
+# (§20B) + dtype validation (§20D) converged on. See docs/fusion-optimiser.md
+# for the empirical rationale.
+#
+# Components: ns5 + normuon + sf (skips MONA and KL-Shampoo — the bake-off
+# showed they add ≤0.4 % beyond SF-NorMuon and KL-Shampoo standalone is
+# unstable). MONA is real (arXiv:2605.26842) but doesn't help at 5 M params.
+
+# --- Core training ---
+optimizer: fusion
+components: ns5,normuon,sf      # SF-NorMuon: NS5 + per-neuron row scale + SF averaging
+loss: smoothl1                  # Temporal loss adds ~1% beyond optimiser; revisit
+hot_dtype: bf16                 # fp32-range exponent, stable NS5 iterates, 1.65x fp32
+mona_alpha: 0.0                 # ignored (not in components); explicit for log clarity
+
+objective: rectified_flow       # MUST match base model (SA Open Small = rectified_flow)
+epochs: 30
+lr: 3.0e-4
+batch_size: 64
+num_workers: 4
+
+# --- Data ---
+subset_frac: 1.0                # ship — full data
+holdout_frac: 0.05              # shared fixed 5 % holdout (matches §18, §19)
+holdout_seed: 12345
+val_frac: 0.02                  # fallback if holdout_frac=0
+tag: ship_fusion_v1
+save_dir: latch_weights
+save_best_only: true
+latent_dir: /run/media/kim/Lehto/latents
+preload: ram
+
+# --- Model architecture (production shrink) ---
+dim: 256
+depth: 4                        # d256/dp4 sweet spot — 67 % inference cost, -1.6 % quality
+num_heads: 8
+t_injection: adaln_zero
+compile: true
+
+# --- Logging ---
+wandb: true
+wandb_project: latch
+tensorboard: false
