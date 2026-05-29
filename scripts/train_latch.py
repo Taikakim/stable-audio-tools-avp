@@ -185,6 +185,7 @@ def train(
     lambda_multi=0.5,
     curriculum_steps=0,
     reset_optimizer=False,
+    hot_dtype="fp32",
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
@@ -340,6 +341,7 @@ def train(
             lr=lr,
             mona_alpha=mona_alpha,
             warmup_steps=warmup,
+            hot_dtype=hot_dtype,
         )
         print("FusionOpt groups:")
         print(summarise_groups(groups))
@@ -810,6 +812,11 @@ if __name__ == "__main__":
     parser.add_argument("--reset-optimizer", action="store_true",
                         help="when resuming FusionOpt from a legacy AdamW checkpoint, drop "
                              "the AdamW optimizer state and re-init z_t = x_t = current weights")
+    parser.add_argument("--hot-dtype", type=str, default=None,
+                        choices=["fp32", "fp16"],
+                        help="FusionOpt spectral hot-path dtype: fp32 (default, safer) or "
+                             "fp16 (faster on RDNA4; ~3-5x NS5 speedup; profile shows NS5 "
+                             "is 42%% of step time, see LATCH_RESULTS.txt §20).")
     parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
@@ -824,7 +831,7 @@ if __name__ == "__main__":
     parser.add_argument("--t-injection", type=str, default=None,
                         choices=["concat", "film", "adaln_zero"],
                         help="timestep injection: 'film' (default, T=256, FA-aligned) | "
-                             "'adaln_zero' (DiT-style per-block, +~50% params, stronger conditioning) | "
+                             "'adaln_zero' (DiT-style per-block, +~50%% params, stronger conditioning) | "
                              "'concat' (legacy, T=257, prepended timestep token)")
     args = parser.parse_args()
 
@@ -880,4 +887,5 @@ if __name__ == "__main__":
         lambda_multi=pick(args.lambda_multi, "lambda_multi", 0.5),
         curriculum_steps=pick(args.curriculum_steps, "curriculum_steps", 0),
         reset_optimizer=args.reset_optimizer or bool(ycfg.get("reset_optimizer", False)),
+        hot_dtype=pick(args.hot_dtype, "hot_dtype", "fp32"),
     )

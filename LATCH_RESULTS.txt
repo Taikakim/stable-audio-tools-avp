@@ -886,3 +886,70 @@ NEXT STEPS (for morning review)
    the noise floor.
 
 ================================================================================
+
+
+================================================================================
+20.  FUSION-OPT MICROBENCH + SHRINK EXPERIMENT  (2026-05-29)
+================================================================================
+
+------------------------------------------------------------------------------
+PART A — per-component microbench on the ship config (dim=256, depth=6, 7.25M params)
+------------------------------------------------------------------------------
+
+Ran scripts/profile_fusion_opt.py — manual torch.cuda.Event timing around each
+of the 7 components, 200 steps total, first 20 discarded for warmup, K_EIGEN=100.
+
+  Component               Total (ms)   Per step (ms)   % step    Notes
+  ---------------------- ----------- --------------- --------    -----
+  mona                       373.18          2.0732     5.4%
+  shampoo_factor             718.01          3.9889    10.4%    L_t += g g.T  per layer
+  shampoo_eigen               61.74          0.3430     0.9%    per-eigen call 34.30 ms, amortised /100
+  shampoo_precon             534.61          2.9701     7.8%    P_L @ m @ P_R
+  ns5                       2872.32         15.9573    41.8%    <- DOMINANT, 5 quintic iters in FP32
+  row_scale                  241.76          1.3431     3.5%
+  sf_average                 219.25          1.2181     3.2%
+  ---------------------- ----------- --------------- --------
+  step_total                6876.55         38.2030   100.0%
+
+Per-shape cost on the most expensive operations (single call):
+
+           Shape  L_t update (ms)  eigen P_L (ms)  precon (ms)
+      (256, 256)         0.0211          6.2422        0.0238
+      (768, 256)         0.0425         21.7755        0.0850
+     (1024, 256)         0.0688         30.9719        0.0988
+     (256, 1024)         0.0624          6.2916        0.0950   <- adapt'ly sized: eigen
+     (1536, 256)         0.1641         49.9767        0.1076      depends on output side
+
+KEY FINDINGS:
+
+(1) NS5 (Muon Newton-Schulz quintic) is the bottleneck at 42% of step time.
+    The spec hypothesised KL-Shampoo's covariance update would dominate at
+    1024×1024 mats — it doesn't. The covariance UPDATE is cheap (3.99 ms total,
+    10%), the EIGENDECOMPOSITION is expensive per-call (35 ms) but amortises to
+    near-zero at K=100 cadence, and the PRECONDITIONER apply is also cheap
+    (2.97 ms). NS5 is what's expensive.
+
+(2) Why NS5 is slow: default `hot_dtype="fp32"` in FusionOpt's __init__.
+    NS5 does 5 iterations × 3 GEMMs = 15 matmuls per spectral parameter per
+    step. With 32 spectral params × 15 GEMMs = ~480 small GEMMs per step, all
+    in FP32. RDNA4's FP32 peak is ~4 TFLOPS (vs FP16's 145 TFLOPS) — a 35x
+    cliff. The spec already calls out a `hot_dtype="fp16"` knob (§3, "NS5
+    quintic on RDNA4: FP16 with FP32 accumulate") but the implementation
+    defaulted to fp32 and the bake-off ran on that default.
+
+(3) Predicted FP16 hot-path speedup: NS5 at 16 ms FP32 -> ~4 ms FP16 = -75%.
+    Step total 38 ms -> ~22-26 ms = roughly AdamW parity. Confirms the spec's
+    cost prediction was right IF the hot_dtype knob is set; my mistake was
+    leaving it at fp32.
+
+ACTIONS TAKEN:
+  - Added --hot-dtype {fp32, fp16} CLI flag to train_latch.py and the YAML
+    mirror (default fp32 preserves existing behaviour).
+  - FusionOpt __init__ already accepted hot_dtype; just wasn't reachable
+    from CLI.
+
+ACTIONS NOT YET TAKEN (for follow-up):
+  - Re-run the bake-off (or just one B2 cell) with --hot-dtype fp16 to
+    confirm the 22-26 ms/step prediction empirically.
+  - Update the spec's "Compute overhead estimate" (~1-2 ms per step in FP16
+    was right; default FP32 path makes it ~16 ms, hence the 3x bake-off cost).
