@@ -186,6 +186,7 @@ def train(
     curriculum_steps=0,
     reset_optimizer=False,
     hot_dtype="fp32",
+    components=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
@@ -309,8 +310,10 @@ def train(
         print(f"torch.compile: mode={compile_mode} (1st-iter warmup will spike)")
     
     # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree | fusion
-    _is_sf = optimizer_name in ("schedulefree", "fusion")
     _is_fusion = optimizer_name == "fusion"
+    # SF .train()/.eval() toggling: needed for schedulefree, and for fusion only when
+    # the "sf" component is active. Resolved after the optimizer is built (see below).
+    _is_sf = optimizer_name == "schedulefree"
     if optimizer_name == "lion":
         from lion_pytorch import Lion
         optimizer = Lion(model.parameters(), lr=lr, weight_decay=1e-2)
@@ -329,22 +332,32 @@ def train(
         optimizer = AdamWScheduleFree(model.parameters(), lr=lr, warmup_steps=warmup)
     elif optimizer_name == "fusion":
         # FusionOpt: bifurcated Muon+MONA+KL-Shampoo (spectral) + ScheduleFree-AdamW (scalar)
-        # with shared Polyak step size. Spec §3.
+        # with shared Polyak step size. Spec §3. --components selects a subset for the
+        # per-component ablation (see LATCH_RESULTS.txt §20).
         from stable_audio_tools.training.fusion_opt import FusionOpt
         from stable_audio_tools.training.fusion_groups import (
             build_fusion_param_groups, summarise_groups,
         )
         warmup = max(100, int(0.05 * epochs * max(1, n_train // batch_size)))
         groups = build_fusion_param_groups(raw_model, spectral_wd=0.01, scalar_wd=0.0)
+        # Parse components string: e.g. "ns5,mona" -> {"ns5", "mona"}; None -> default (all)
+        comps_set = None
+        if components is not None:
+            comps_set = set(s.strip() for s in str(components).split(",") if s.strip())
         optimizer = FusionOpt(
             groups,
             lr=lr,
             mona_alpha=mona_alpha,
             warmup_steps=warmup,
             hot_dtype=hot_dtype,
+            components=comps_set,
         )
+        # SF .train()/.eval() toggle only when the SF averaging component is active
+        _is_sf = optimizer.uses_sf_averaging
         print("FusionOpt groups:")
         print(summarise_groups(groups))
+        print(f"FusionOpt components: {sorted(optimizer.components)}  "
+              f"(SF averaging: {optimizer.uses_sf_averaging})")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr)
     sched = None
@@ -817,6 +830,13 @@ if __name__ == "__main__":
                         help="FusionOpt spectral hot-path dtype: fp32 (default, safer) or "
                              "fp16 (faster on RDNA4; ~3-5x NS5 speedup; profile shows NS5 "
                              "is 42%% of step time, see LATCH_RESULTS.txt §20).")
+    parser.add_argument("--components", type=str, default=None,
+                        help="FusionOpt: comma-separated subset of "
+                             "{mona,shampoo,ns5,normuon,sf}. Default = all (full Fusion). "
+                             "Use 'ns5' for plain Muon, 'mona,ns5' for MONA, "
+                             "'shampoo' for KL-Shampoo only, 'sf' for ScheduleFree+, "
+                             "'ns5,normuon,sf' for SF-NorMuon. See LATCH_RESULTS.txt §20 "
+                             "for the per-component ablation results.")
     parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
@@ -888,4 +908,5 @@ if __name__ == "__main__":
         curriculum_steps=pick(args.curriculum_steps, "curriculum_steps", 0),
         reset_optimizer=args.reset_optimizer or bool(ycfg.get("reset_optimizer", False)),
         hot_dtype=pick(args.hot_dtype, "hot_dtype", "fp32"),
+        components=pick(args.components, "components", None),
     )

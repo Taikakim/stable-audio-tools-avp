@@ -114,7 +114,26 @@ class FusionOpt(Optimizer):
         # (kept FP32 by default for safety; FP16 on RDNA4 if profiling shows need)
         hot_dtype: str = "fp32",
         warmup_steps: int = 0,
+        # Component flags — controls which mechanisms run in the spectral path.
+        # Use this for the per-component ablation (one optimiser at a time).
+        # Default = full Fusion (everything on). Valid components:
+        #   "mona"     - MONA curvature-augmented momentum
+        #   "shampoo"  - KL-Shampoo two-sided preconditioner
+        #   "ns5"      - Muon Newton-Schulz quintic spectral norm
+        #   "normuon"  - SF-NorMuon per-neuron row-norm scaling
+        #   "sf"       - Schedule-Free averaging (z_t fast iterate + x_t average,
+        #                Polyak step, WD on z_t). When disabled, weight decay
+        #                applies to live weights p directly.
+        components: "set[str] | None" = None,
     ):
+        all_components = {"mona", "shampoo", "ns5", "normuon", "sf"}
+        if components is None:
+            components = all_components
+        components = set(components)
+        unknown = components - all_components
+        if unknown:
+            raise ValueError(f"FusionOpt: unknown components: {sorted(unknown)} "
+                             f"(valid: {sorted(all_components)})")
         defaults = dict(
             lr=lr,
             beta=beta, beta_p=beta_p, gamma_min=gamma_min, gamma_max=gamma_max,
@@ -126,6 +145,7 @@ class FusionOpt(Optimizer):
         )
         super().__init__(params, defaults)
 
+        self._components = frozenset(components)
         self._mode = "train"  # "train" or "eval"
         self._step_count = 0
         # Pending loss for Polyak (set by train loop before step)
@@ -141,6 +161,17 @@ class FusionOpt(Optimizer):
                     "FusionOpt param groups must set group_type=spectral|scalar"
                 )
 
+    @property
+    def uses_sf_averaging(self) -> bool:
+        """Whether this optimiser uses Schedule-Free averaging (the .train()/.eval()
+        toggle behaviour). False when 'sf' is excluded from components."""
+        return "sf" in self._components
+
+    @property
+    def components(self) -> "frozenset[str]":
+        """Currently enabled components. Useful for logging / introspection."""
+        return self._components
+
     # ---- public ---------------------------------------------------------
 
     def set_loss(self, loss: torch.Tensor | None) -> None:
@@ -153,10 +184,13 @@ class FusionOpt(Optimizer):
         self._current_loss = loss.detach() if loss is not None else None
 
     def train(self) -> None:
-        """Switch params to the eval-point y = (1-beta)*z + beta*x."""
+        """Switch params to the eval-point y = (1-beta)*z + beta*x.
+        No-op when SF averaging is disabled (live weights are always in p)."""
         if self._mode == "train":
             return
         self._mode = "train"
+        if "sf" not in self._components:
+            return
         for group in self.param_groups:
             beta = group["beta"]
             for p in group["params"]:
@@ -166,10 +200,13 @@ class FusionOpt(Optimizer):
                 p.data.copy_((1 - beta) * st["z"] + beta * st["x"])
 
     def eval(self) -> None:
-        """Switch params to the averaged iterate x (deployable model)."""
+        """Switch params to the averaged iterate x (deployable model).
+        No-op when SF averaging is disabled."""
         if self._mode == "eval":
             return
         self._mode = "eval"
+        if "sf" not in self._components:
+            return
         for group in self.param_groups:
             for p in group["params"]:
                 st = self.state.get(p, None)
@@ -178,13 +215,15 @@ class FusionOpt(Optimizer):
                 p.data.copy_(st["x"])
 
     def average_state_dict(self) -> dict[str, torch.Tensor]:
-        """Return {param_name: x_t} for serialisation as a deployable model."""
+        """Return {param_name: x_t} for serialisation as a deployable model.
+        When SF averaging is disabled, returns the live weights (which ARE the
+        deployable model in that case)."""
         out: dict[str, torch.Tensor] = {}
         for group in self.param_groups:
             names = group.get("param_names", [])
             for p, name in zip(group["params"], names):
                 st = self.state.get(p, None)
-                if st is None or "x" not in st:
+                if "sf" not in self._components or st is None or "x" not in st:
                     out[name] = p.detach().clone()
                 else:
                     out[name] = st["x"].detach().clone()
@@ -209,7 +248,8 @@ class FusionOpt(Optimizer):
                 self._scalar_group_step(group, gamma_ratio)
 
         # After updating z and x, write y back to p.data for next forward.
-        if self._mode == "train":
+        # Skipped when SF averaging is disabled: live weights are already in p.
+        if self._mode == "train" and "sf" in self._components:
             for group in self.param_groups:
                 beta = group["beta"]
                 for p in group["params"]:
@@ -325,53 +365,66 @@ class FusionOpt(Optimizer):
                 state["step"] = 0
 
             # 1. KL-Shampoo factor update from RAW gradient (every step, FP32)
-            L = state["L"]
-            R = state["R"]
-            L.mul_(beta_k).add_(grad @ grad.transpose(-1, -2), alpha=(1 - beta_k))
-            R.mul_(beta_k).add_(grad.transpose(-1, -2) @ grad, alpha=(1 - beta_k))
+            if "shampoo" in self._components:
+                L = state["L"]
+                R = state["R"]
+                L.mul_(beta_k).add_(grad @ grad.transpose(-1, -2), alpha=(1 - beta_k))
+                R.mul_(beta_k).add_(grad.transpose(-1, -2) @ grad, alpha=(1 - beta_k))
 
-            # 2. Periodic eigendecomp -> P_L, P_R (every K steps, FP32 island)
-            if self._step_count % eigen_period == 0:
-                state["P_L"] = _inv_quarter(L, delta=delta)
-                state["P_R"] = _inv_quarter(R, delta=delta)
+                # 2. Periodic eigendecomp -> P_L, P_R (every K steps, FP32 island)
+                if self._step_count % eigen_period == 0:
+                    state["P_L"] = _inv_quarter(L, delta=delta)
+                    state["P_R"] = _inv_quarter(R, delta=delta)
 
-            # 3. MONA augmented momentum (FP32)
-            A_buf = state["A"]
-            g_prev = state["g_prev"]
-            A_buf.mul_(beta_n).add_(grad - g_prev)
-            g_prev.copy_(grad)
-
+            # 3. MONA augmented momentum (FP32) — optional
             m = state["m"]
-            m.mul_(mu).add_(grad + alpha * A_buf)
+            if "mona" in self._components:
+                A_buf = state["A"]
+                g_prev = state["g_prev"]
+                A_buf.mul_(beta_n).add_(grad - g_prev)
+                g_prev.copy_(grad)
+                m.mul_(mu).add_(grad + alpha * A_buf)
+            else:
+                # Plain momentum
+                m.mul_(mu).add_(grad)
 
-            # 4. Hot path: preconditioner + NS5
-            #    Cast to hot_dtype, accumulate via PyTorch's default behaviour.
-            P_L_h = state["P_L"].to(hot_dtype)
-            P_R_h = state["P_R"].to(hot_dtype)
-            m_h = m.to(hot_dtype)
-            m_pre = P_L_h @ m_h @ P_R_h
-            U = newton_schulz_5(m_pre).float()
+            # 4. Apply KL-Shampoo preconditioner (optional)
+            if "shampoo" in self._components:
+                P_L_h = state["P_L"].to(hot_dtype)
+                P_R_h = state["P_R"].to(hot_dtype)
+                m_h = m.to(hot_dtype)
+                m_pre = P_L_h @ m_h @ P_R_h
+            else:
+                m_pre = m.to(hot_dtype)
 
-            # 5. Aspect-ratio scale (Muon)
-            out_dim, in_dim = U.shape
-            U.mul_((max(1.0, out_dim / in_dim)) ** 0.5)
+            # 5. Muon NS5 spectral normalisation (optional)
+            if "ns5" in self._components:
+                U = newton_schulz_5(m_pre).float()
+                out_dim, in_dim = U.shape
+                U.mul_((max(1.0, out_dim / in_dim)) ** 0.5)  # aspect-ratio scale
+            else:
+                U = m_pre.float()
 
-            # 6. SF-NorMuon per-neuron row scaling
-            r = state["r"]
-            row_ss = (U * U).sum(dim=-1)  # (out_dim,)
-            r.mul_(beta_r).add_(row_ss, alpha=(1 - beta_r))
-            U = U / (r.clamp_min(1e-12).sqrt().unsqueeze(-1))
+            # 6. SF-NorMuon per-neuron row scaling (optional)
+            if "normuon" in self._components:
+                r = state["r"]
+                row_ss = (U * U).sum(dim=-1)  # (out_dim,)
+                r.mul_(beta_r).add_(row_ss, alpha=(1 - beta_r))
+                U = U / (r.clamp_min(1e-12).sqrt().unsqueeze(-1))
 
-            # 7. Schedule-Free update on z_t (WD on fast iterate)
-            z = state["z"]
-            x = state["x"]
+            # 7. Update — Schedule-Free averaging (with WD on z_t) OR direct on p
             t = state["step"] + 1
             state["step"] = t
-
-            # z_{t+1} = (1 - gamma*wd) z_t - gamma * U
-            z.mul_(1 - gamma_t * wd).add_(U, alpha=-gamma_t)
-            # x_{t+1} = (1 - 1/t) x_t + (1/t) z_{t+1}
-            x.mul_(1 - 1.0 / t).add_(z, alpha=1.0 / t)
+            if "sf" in self._components:
+                z = state["z"]
+                x = state["x"]
+                # z_{t+1} = (1 - gamma*wd) z_t - gamma * U
+                z.mul_(1 - gamma_t * wd).add_(U, alpha=-gamma_t)
+                # x_{t+1} = (1 - 1/t) x_t + (1/t) z_{t+1}
+                x.mul_(1 - 1.0 / t).add_(z, alpha=1.0 / t)
+            else:
+                # No SF averaging: apply WD + step directly to live weights p
+                p.data.mul_(1 - gamma_t * wd).add_(U.to(p.dtype), alpha=-gamma_t)
 
     # ---- scalar path ----------------------------------------------------
 
@@ -416,10 +469,14 @@ class FusionOpt(Optimizer):
             v_hat = v / bias2
             u = m_hat / (v_hat.sqrt() + eps)
 
-            z = state["z"]
-            x = state["x"]
-            z.mul_(1 - gamma_t * wd).add_(u, alpha=-gamma_t)
-            x.mul_(1 - 1.0 / t).add_(z, alpha=1.0 / t)
+            if "sf" in self._components:
+                z = state["z"]
+                x = state["x"]
+                z.mul_(1 - gamma_t * wd).add_(u, alpha=-gamma_t)
+                x.mul_(1 - 1.0 / t).add_(z, alpha=1.0 / t)
+            else:
+                # No SF averaging: plain AdamW step on live weights p
+                p.data.mul_(1 - gamma_t * wd).add_(u.to(p.dtype), alpha=-gamma_t)
 
     # ---- diagnostic -----------------------------------------------------
 
