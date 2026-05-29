@@ -1015,3 +1015,89 @@ the model — net win on both axes vs the current ship.
 (d256/dp4 wasn't in the official Phase 1 matrix; comparison is across runs
 with the same seed, holdout, and subset, so within ±~2% it's reliable.)
 
+
+
+------------------------------------------------------------------------------
+PART C — per-component bake-off: how does each inspiration perform alone?
+------------------------------------------------------------------------------
+
+Ran each of the spec's "inspiration" optimisers as a standalone cell on
+rms_energy_bass at seed 1, subset 0.3, 20 epochs, SmoothL1 loss (so the
+optimiser effect is isolated from the loss effect). Reference points from
+§19's matrix:
+
+  A1 (AdamW + SmoothL1)                 val_point_mae 3.4683   baseline
+  B1 (Full Fusion + SmoothL1)           val_point_mae 3.1921   -8.0% vs A1
+  B2 (Full Fusion + Temporal)           val_point_mae 3.1785   -8.4% vs A1
+
+  optimiser       --components             val_point_mae   Δ vs A1     val_deriv_corr
+  ------------    -----------------------  -------------   --------    --------------
+  Muon            ns5                          3.5619       +2.7%        0.7151
+  MONA            ns5,mona                     3.6709       +5.8%        0.7121
+  KL-Shampoo      shampoo                       NaN         DIVERGED     —
+  ScheduleFree+   sf                           4.2949      +23.8%        0.4273
+  SF-NorMuon      ns5,normuon,sf               3.2063       -7.6%        0.7291
+  Full Fusion B1  ns5,mona,shampoo,normuon,sf  3.1921       -8.0%        0.7306
+
+KEY FINDINGS:
+
+(1) Individual components mostly UNDERPERFORM plain AdamW. Pure Muon is
+    +2.7%, MONA is +5.8%, ScheduleFree+ is +23.8%, KL-Shampoo doesn't
+    converge at all. The hype around any single one of these as a drop-in
+    AdamW replacement doesn't survive a fair head-to-head on LatCH.
+
+(2) ONLY SF-NorMuon (NS5 + per-neuron row scale + Schedule-Free averaging)
+    beats AdamW as a standalone (-7.6%). It captures the bulk of Fusion's
+    quality lift on its own — adding Shampoo + MONA on top only buys an
+    extra -0.4% (B1 at -8.0% vs SF-NorMuon at -7.6%). This argues for a
+    "SF-NorMuon" minimum-viable variant of FusionOpt for production: it's
+    almost all of the win with less code surface and fewer hyperparameters.
+
+(3) MONA (Muon + curvature deflection) underperforms PURE Muon (+5.8% vs
+    +2.7%). The α=0.2 curvature term is destabilising in this regime — it
+    works inside Full Fusion because KL-Shampoo's preconditioner softens
+    the deflected direction. Without Shampoo, MONA's curvature term
+    pushes the spectral path off course. Not a generic improvement.
+
+(4) KL-Shampoo standalone DIVERGES TO NaN in epoch 1. The (L+δI)^{-1/4}
+    preconditioner has no spectral-norm bound on its own; without NS5 to
+    clip the update magnitude, the Polyak step ratio + aggressive
+    Kronecker rescaling blows the iterate. This is the classical Shampoo
+    instability — public Shampoo implementations "graft" with Adam exactly
+    to clip this. The spec's choice to compose KL-Shampoo with NS5 turns
+    out to be load-bearing.
+
+(5) ScheduleFree+ standalone (no NS5, no Shampoo, no MONA — just SF
+    averaging + Polyak on plain Adam-style direction) is the WORST of the
+    pack at +23.8%. The Polyak step ratio without spectral-norm clipping
+    interacts badly: with γ_max=10x base LR, an effective 3e-3 LR on raw
+    Adam-style updates exceeds the model's stability envelope for this
+    feature. Schedule-Free needs the spectral path constraints to be safe.
+
+(6) Composition is the win. The full Fusion is greater than the sum of
+    its parts: each component individually buys little or hurts, but
+    composed they bind into a stable, effective optimiser. Best
+    interpretation: NS5 provides the spectral norm bound that makes
+    Shampoo, MONA, and Schedule-Free safe to use; row scaling provides
+    per-neuron magnitude adaptation; SF averaging provides the anytime-
+    stopping property — and only the joint package delivers.
+
+Per-cell timing:
+  Muon            ~12.5 min (ns5 cost dominates)
+  MONA            ~12   min (ns5 dominates; mona EMA cost ~negligible)
+  KL-Shampoo       ~5.5 min (diverged early; otherwise no ns5 = faster)
+  ScheduleFree+    ~7.5 min (no spectral tricks = fastest finishing)
+  SF-NorMuon      ~13   min (ns5 + row scaling + averaging)
+  (Full Fusion in §19: ~18 min)
+
+SHIPPING IMPLICATION: if you want one number to take from this entire §20:
+SF-NorMuon (--components ns5,normuon,sf) at d256/dp4 should be the
+production target. It's 67% the inference cost of current ship AND -7.6%
+on val_point_mae (which compounds with the -1.6% inference-shrink penalty
+to a NET ~6% quality lift over current ship A1).
+
+The full Fusion's extra 0.4% lift over SF-NorMuon is not worth the extra
+implementation surface (KL-Shampoo eigendecomp, MONA curvature buffers)
+for the marginal quality gain.
+
+================================================================================
