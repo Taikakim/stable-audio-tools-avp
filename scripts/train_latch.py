@@ -826,10 +826,12 @@ if __name__ == "__main__":
                         help="when resuming FusionOpt from a legacy AdamW checkpoint, drop "
                              "the AdamW optimizer state and re-init z_t = x_t = current weights")
     parser.add_argument("--hot-dtype", type=str, default=None,
-                        choices=["fp32", "fp16"],
-                        help="FusionOpt spectral hot-path dtype: fp32 (default, safer) or "
-                             "fp16 (faster on RDNA4; ~3-5x NS5 speedup; profile shows NS5 "
-                             "is 42%% of step time, see LATCH_RESULTS.txt §20).")
+                        choices=["fp32", "fp16", "bf16"],
+                        help="FusionOpt spectral hot-path dtype: fp32 (default, safer), "
+                             "fp16 (max speed on RDNA4, narrower range), or bf16 (wider "
+                             "range like fp32, fewer mantissa bits — safer for NS5's "
+                             "iterated matmul that compounds error). Profile shows NS5 is "
+                             "42%% of step time at fp32, see LATCH_RESULTS.txt §20A.")
     parser.add_argument("--components", type=str, default=None,
                         help="FusionOpt: comma-separated subset of "
                              "{mona,shampoo,ns5,normuon,sf}. Default = all (full Fusion). "

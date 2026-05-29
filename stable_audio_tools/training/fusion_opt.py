@@ -337,7 +337,10 @@ class FusionOpt(Optimizer):
 
         gamma_t = lr * gamma_ratio * warm
 
-        hot_dtype = torch.float16 if hot_dtype_name == "fp16" else torch.float32
+        hot_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }.get(hot_dtype_name, torch.float32)
 
         for p in group["params"]:
             if p.grad is None:
