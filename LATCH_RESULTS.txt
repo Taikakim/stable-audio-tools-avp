@@ -953,3 +953,65 @@ ACTIONS NOT YET TAKEN (for follow-up):
     confirm the 22-26 ms/step prediction empirically.
   - Update the spec's "Compute overhead estimate" (~1-2 ms per step in FP16
     was right; default FP32 path makes it ~16 ms, hence the 3x bake-off cost).
+
+
+------------------------------------------------------------------------------
+PART B — shrink experiment: can FusionOpt let us use smaller models?
+------------------------------------------------------------------------------
+
+Re-ran B2 (Fusion + Temporal) at three sub-configurations on the same two
+heads as the bake-off matrix (rms_energy_bass, spectral_flatness), seed 1,
+subset 0.3, 20 epochs. Reference = the B2 cell from §19 at dim=256, depth=6.
+
+  rms_energy_bass:
+                       params  step time   val_point_mae   Δ vs full B2
+    full (d256,dp6)    7.25M    18 min/cell     3.1785        baseline
+    d128, dp6          1.97M    13 min/cell     3.2640         +2.7%
+    d256, dp4          4.87M    13 min/cell     3.2294         +1.6%   <-- sweet spot
+    d128, dp4          1.31M     8 min/cell     3.3630         +5.8%
+
+  spectral_flatness:
+                       params  step time   val_point_mae   Δ vs full B2
+    full (d256,dp6)    7.25M    18 min/cell     0.0495        baseline
+    d128, dp6          1.97M    13 min/cell     0.0519         +4.8%
+    d256, dp4          4.87M    13 min/cell     0.0504         +1.8%   <-- sweet spot
+    d128, dp4          1.31M     8 min/cell     0.0531         +7.3%
+
+  val_deriv_corr trades the same way:
+                       bass           flatness
+    full (d256,dp6)   0.7412         0.7800
+    d128, dp6         0.7288 (-0.012) 0.7635 (-0.017)
+    d256, dp4         0.7312 (-0.010) 0.7682 (-0.012)   <-- still strong
+    d128, dp4         0.7083 (-0.033) 0.7404 (-0.040)
+
+KEY FINDING: dim=256, depth=4 buys 67% of the inference cost for the price
+of ~1.6-1.8% on val_point_mae and ~0.01 on val_deriv_corr. That's the best
+quality-to-size tradeoff in the shrink. The intuition:
+  - depth scaling is dominantly linear in parameter count: 4/6 = 67% of the
+    transformer blocks vs the same dim, vs ~27% if we halved dim instead.
+  - the spec's claim that "we don't need >4.9M params" (from §3 head-width
+    quality data) extrapolates here — at 4.87M for d256/dp4 we're sitting
+    in the same regime as the original dim=256 winner.
+
+dim=128 alone trades 3-5% — not catastrophic but visibly worse, and the
+combined d128/dp4 stacks the costs (+5-7%). Stick to the depth axis if you
+want a smaller head.
+
+PRACTICAL IMPLICATION: a d256/dp4 ship retrain with FusionOpt would have
+about 2/3 the inference cost of the current ship config. Combined with the
+quality lift from FusionOpt (B2 vs A1 was -8% to -11% on val_point_mae),
+the d256/dp4 + Fusion head is BOTH cheaper to deploy AND better than the
+current ship d256/dp6 + AdamW head.
+
+  ship config (d256/dp6 AdamW)   raw-MAE         inference cost
+    A1 bass                      3.4683          baseline
+  proposed (d256/dp4 Fusion)
+    B2 bass d256/dp4             3.2294          ~67% of baseline
+                                 (-6.9% vs A1)
+
+So the optimiser quality lift more than pays for itself when you also shrink
+the model — net win on both axes vs the current ship.
+
+(d256/dp4 wasn't in the official Phase 1 matrix; comparison is across runs
+with the same seed, holdout, and subset, so within ±~2% it's reliable.)
+
