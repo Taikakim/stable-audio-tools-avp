@@ -188,7 +188,7 @@ python scripts/train_latch.py --config latch_train.yaml \
   --seed 1 --save-best-only
 ```
 
-> **Important**: `--hot-dtype fp16` looked promising in the microbench (2.65× speedup) but **diverges to NaN after ~2 steps** in practice. The NS5 quintic's iterated `X (XᵀX)²` overflows fp16's 65 504 max during the first optimiser step on LatCH's 1024×256 mats. bf16 has fp32-equivalent exponent range (8-bit), runs stably, costs 1 % on val_point_mae, and is ~1.65× faster than fp32 (limited by un-tuned hipBLASLt kernels — a one-time bf16 TunableOp calibration would close the gap to ~3×). See LATCH_RESULTS.txt §20 Part D.
+> **Important**: `--hot-dtype fp16` looked promising in the microbench (2.65× speedup) but **diverges to NaN after ~2 steps** in practice. The NS5 quintic's iterated `X (XᵀX)²` overflows fp16's 65 504 max during the first optimiser step on LatCH's 1024×256 mats. bf16 has fp32-equivalent exponent range (8-bit), runs stably, costs 1 % on val_point_mae, and is ~1.65× faster than fp32. We tested whether re-tuning the bf16 kernels in hipBLASLt could push that further — answer is no, the bf16 kernels are already near-optimal for our 256-grid shapes; 26 it/s is the ceiling. A future speed lever is fp16-with-fp32-intermediates inside NS5 (~50 lines, would give another ~1.6×). See LATCH_RESULTS.txt §20 Part D.
 
 Why this combination:
 - **SF-NorMuon over Full Fusion**: captures 95 % of the quality lift with less implementation surface (no KL-Shampoo eigendecomp, no MONA buffers). The +0.4 % bump from Full Fusion isn't worth the extra hyperparameters and per-step overhead.

@@ -1138,16 +1138,35 @@ WHY bf16 ISN'T AS FAST AS PREDICTED:
 
   Microbench predicted ~22 ms total step in fp16 (vs 38 ms in fp32);
   bf16 in practice hits 26.4 it/s = 37 ms/step — only 1.65x over fp32's
-  ~16 it/s = 62 ms/step. The reason isn't the dtype, it's hipBLASLt
-  shape-tuning: the SA3 TunableOp cache has 718 fp16 shapes tuned but
-  only 3 bf16 shapes. LatCH's 256-grid matrices fall onto un-tuned bf16
-  kernels. Running a one-time bf16 TunableOp calibration pass (analogous
-  to the existing fp16 one) would close most of the gap to ~50 it/s.
+  ~16 it/s = 62 ms/step. Original hypothesis: hipBLASLt's bf16 kernels
+  weren't tuned. Tested: cleared the 3 "Default" bf16 entries from the
+  TunableOp cache and re-ran with extended autotuner budget
+  (PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS=500). Result: TunableOp
+  found named kernels for 2 of 3, but the new kernels are WITHIN 1%
+  of the Default path. Default isn't slow; hipBLASLt's bf16 path is
+  genuinely close to optimal for our 256-grid shapes.
+
+  Concrete numbers from the cache diff:
+    nn_1024_256_1024  Default 16.65us  ->  Hipblaslt_71584  16.67us
+    nn_768_256_256    Default 11.76us  ->  still Default   11.81us
+    tn_768_256_768    Default 14.55us  ->  re-tuned        14.40us
+
+  Conclusion: 26 it/s is the realistic bf16 ceiling on this stack for
+  these shapes. The 1.65x speedup over fp32 reflects the intrinsic
+  throughput ratio (RDNA4 bf16 ~44 TFLOPS in our SA3 cache vs fp32
+  ~4 TFLOPS), not a tuning gap. Earlier claim "tuned bf16 closes to
+  ~3x" was wrong.
+
+  The fp16 path could theoretically deliver the predicted 22 ms, but
+  needs ~50 lines of code to cast NS5 intermediates to fp32 between
+  matmuls (avoiding the overflow that diverged the naive fp16 attempt).
+  Worth it if 1.6x further speedup matters; otherwise bf16 is the
+  practical answer at 26 it/s.
 
 RECOMMENDATION:
 
-  Production hot-dtype = bf16.  Stable, ~1.65x faster than fp32 at
-  current shape-tunings; predicted ~3x with bf16-tuned kernels.
+  Production hot-dtype = bf16.  Stable, ~1.65x faster than fp32.
+  fp16-with-fp32-NS5-intermediates is the next speed lever if needed.
 
   fp16 is unusable for NS5 without re-engineering the iteration to keep
   intermediates in FP32 (cast between matmuls), which would partially
