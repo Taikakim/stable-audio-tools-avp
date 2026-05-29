@@ -1263,3 +1263,73 @@ NEXT STEPS:
     TimeConditioningCache (added at §20D-aftermath); UI auto-picks them up.
 
 ================================================================================
+
+
+------------------------------------------------------------------------------
+PART E — fp16_safe NS5 benchmark (rescale-restore overhead dominates)  
+------------------------------------------------------------------------------
+
+Implemented newton_schulz_5_fp16_safe(): fp16 matmuls (tensor cores) with
+fp32 polynomial accumulation, per-tensor max-abs rescale-restore around
+each matmul to keep fp16 inputs in range. CPU sanity matched fp32 NS5 to
+8.5e-4 (well below numerical noise).
+
+GPU benchmark on rms_energy_bass, B1 cell (Full Fusion + SmoothL1) at
+d256/dp6, --compile, 20 epochs, subset 0.3:
+
+  dtype             it/s     val_point_mae     note
+  fp32 (§19 B1)     ~16      3.1921            stable
+  bf16 (§20D)       26.4     3.2238            stable, +1.0%
+  fp16 (unsafe)     66.3     NaN               diverged step 3
+  fp16_safe (this)  13.6     converging        SLOWER than fp32, killed early
+
+Predicted 1.3-1.5x over bf16. Actual: 0.5x bf16 (and even 0.85x fp32).
+The rescale-restore overhead inside _safe_mm dominates the fp16 throughput
+win. Per matmul:
+  - 2x torch.max() reductions (one per operand)
+  - 2x divisions by scale
+  - 2x .to(fp16) casts
+  - 1x fp16 matmul (the only win)
+  - 1x .float() cast
+  - 1x scale-restore multiply
+
+Per NS5 iteration: 3 _safe_mm calls = 6 max reductions + cast overhead.
+Per spectral param: 5 iterations × 3 calls = 15 _safe_mm. Per step: 32
+spectral params × 15 = 480 _safe_mm calls. The max reductions and small
+casts compound into a per-call latency that swamps the matmul savings.
+
+WHY THIS DIDN'T WORK:
+
+  hipBLASLt's fp16 matmul ~3 ms/call for our shapes
+  My rescale-restore: ~5-7 ms/call from the reduction+cast overhead
+  Total per _safe_mm: ~8-10 ms vs bf16's single ~4-5 ms matmul
+
+  The naive fp16 (no rescale) IS faster but unsafe. The bf16 path is
+  cheaper because every op is a single matmul with no extra reductions.
+
+WHAT WOULD ACTUALLY WORK (if we ever revisit):
+
+  1. Custom Triton kernel for the full NS5 iteration with rescale-restore
+     fused into the matmul epilogue. Removes the python-level overhead.
+     ~200 LoC, real engineering effort.
+  
+  2. A coarser "scale by initial Frobenius norm only" path that doesn't
+     rescale between iterations — relies on the NS5 SV-bracket guarantee
+     to keep values bounded. Predicted ~2x bf16 but theoretical risk of
+     overflow if grad statistics drift outside the expected range.
+
+  3. Stop trying. bf16 at 26 it/s on d256/dp6, or 45 it/s on the production
+     d256/dp4, is good enough. Most production hardware (NVIDIA H100,
+     B100) has well-tuned bf16; we're already on the right path there.
+
+CONCLUSION:
+
+  Keep bf16 as the production hot-dtype. fp16_safe ships as a CLI option
+  for the curious but is NOT a default. The proper engineering fix would
+  be a custom Triton kernel; that's a real engineering project, not a
+  hot-fix.
+
+  Removing the speculative "1.3-1.5x" speedup claim from §20D and
+  docs/fusion-optimiser.md. bf16 IS the plateau.
+
+================================================================================

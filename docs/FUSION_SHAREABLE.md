@@ -338,9 +338,13 @@ Plus the model-forward and block-forward adjustments shown above.
 
 These didn't get answered in our work and would benefit from collaboration:
 
-- **fp16 with rescale-and-restore inside NS5.** Pre-scale X so element
-  values fit fp16, do matmul, restore. Predicted ~1.3–1.5× over bf16
-  if it works. Not yet tested.
+- **fp16 with rescale-and-restore inside NS5.** Tested and rejected on
+  RDNA4: the rescale-restore overhead (~6 max-reductions × 480 matmuls/step)
+  dominates the fp16 throughput win, giving 0.5× bf16 throughput. A custom
+  Triton kernel with rescale fused into the matmul epilogue could reclaim
+  the theoretical 1.3–1.5×, but that's ~200 LoC of real engineering, not
+  a hot-fix. Whether the same conclusion holds on H100 / Blackwell isn't
+  obvious — on NVIDIA the fp16 matmul vs reduction ratios differ.
 - **TimeConditioningCache for non-rectified-flow schedules.** The schedule
   enumeration in `warm_for_schedule` is RF-specific. Adapt for SA3's
   noise schedule (probably similar but worth checking).
