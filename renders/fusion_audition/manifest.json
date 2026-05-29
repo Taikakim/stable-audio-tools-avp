@@ -1,0 +1,260 @@
+{
+  "version": 1,
+  "render_settings": {
+    "prompt": "Goa trance upbeat song, melancholy, korg, Roland, analog synths",
+    "steps": 40,
+    "cfg_scale": 7.0,
+    "model": "Stable Audio Open Small",
+    "seed": 42
+  },
+  "variants": [
+    "adamw_a1",
+    "base",
+    "sfnormuon"
+  ],
+  "axes": {
+    "rho": [
+      2,
+      8
+    ],
+    "mu": [
+      1,
+      4
+    ],
+    "gamma": [
+      0.5
+    ],
+    "weight": [
+      4,
+      8,
+      32
+    ],
+    "start": [
+      0.0,
+      0.33
+    ],
+    "end": [
+      0.7,
+      1.0
+    ],
+    "value": [
+      -15
+    ]
+  },
+  "entries": [
+    {
+      "file": "adamw_a1__r2_m1_g50_w32_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 2,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 32,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1469406
+    },
+    {
+      "file": "adamw_a1__r2_m1_g50_w4_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 2,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 4,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1453263
+    },
+    {
+      "file": "adamw_a1__r2_m4_g50_w8_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 2,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1480192
+    },
+    {
+      "file": "adamw_a1__r8_m1_g50_w8_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 8,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1463971
+    },
+    {
+      "file": "adamw_a1__r8_m4_g50_w32_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 32,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1445360
+    },
+    {
+      "file": "adamw_a1__r8_m4_g50_w4_s00_e100_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 4,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1467389
+    },
+    {
+      "file": "adamw_a1__r8_m4_g50_w8_s00_e070_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 0.7,
+      "value": -15,
+      "size_bytes": 1413499
+    },
+    {
+      "file": "adamw_a1__r8_m4_g50_w8_s33_e070_v-15.flac",
+      "variant": "adamw_a1",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.33,
+      "end": 0.7,
+      "value": -15,
+      "size_bytes": 1416674
+    },
+    {
+      "file": "base.flac",
+      "variant": "base",
+      "guided": false,
+      "size_bytes": 1338488
+    },
+    {
+      "file": "sfnormuon__r2_m1_g50_w32_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 2,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 32,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1483982
+    },
+    {
+      "file": "sfnormuon__r2_m1_g50_w4_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 2,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 4,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1448842
+    },
+    {
+      "file": "sfnormuon__r2_m4_g50_w8_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 2,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1487043
+    },
+    {
+      "file": "sfnormuon__r8_m1_g50_w8_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 8,
+      "mu": 1,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1482498
+    },
+    {
+      "file": "sfnormuon__r8_m4_g50_w32_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 32,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1385417
+    },
+    {
+      "file": "sfnormuon__r8_m4_g50_w4_s00_e100_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 4,
+      "start": 0.0,
+      "end": 1.0,
+      "value": -15,
+      "size_bytes": 1488604
+    },
+    {
+      "file": "sfnormuon__r8_m4_g50_w8_s00_e070_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.0,
+      "end": 0.7,
+      "value": -15,
+      "size_bytes": 1429035
+    },
+    {
+      "file": "sfnormuon__r8_m4_g50_w8_s33_e070_v-15.flac",
+      "variant": "sfnormuon",
+      "guided": true,
+      "rho": 8,
+      "mu": 4,
+      "gamma": 0.5,
+      "weight": 8,
+      "start": 0.33,
+      "end": 0.7,
+      "value": -15,
+      "size_bytes": 1430722
+    }
+  ]
+}

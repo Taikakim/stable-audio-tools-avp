@@ -244,9 +244,11 @@ def load_latch_from_checkpoint(path: str, device="cpu") -> LatCH:
     raw = torch.load(path, map_location=device, weights_only=True)
 
     if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
-        # FusionOpt heads: prefer averaged x_t over the live z_t for inference
+        # FusionOpt heads: prefer averaged x_t over the live z_t for inference, but
+        # MERGE with state_dict so non-parameter buffers (rotary_emb.inv_freq, etc.)
+        # which FusionOpt's average_state_dict doesn't track come along automatically.
         if "averaged_state_dict" in raw and isinstance(raw["averaged_state_dict"], dict):
-            state = raw["averaged_state_dict"]
+            state = {**raw["state_dict"], **raw["averaged_state_dict"]}
         else:
             state = raw["state_dict"]
         metadata = {
