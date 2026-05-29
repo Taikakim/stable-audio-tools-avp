@@ -188,6 +188,12 @@ def train(
     hot_dtype="fp32",
     components=None,
     fp32_audit_period=0,
+    # Diversity training (see stable_audio_tools/training/diversity_loss.py)
+    diversity_ref=None,         # path to a LatCH checkpoint to use as the frozen reference
+    lambda_div=0.3,             # target weight on the diversity penalty
+    div_warmup_steps=0,         # linear ramp for lambda_div over this many steps
+    div_mse_bound=100.0,        # cap on MSE(pred, ref_pred) before negating
+    warm_start=False,           # initialize the new head's weights from `diversity_ref`
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
@@ -303,6 +309,20 @@ def train(
     # Init Model — out_channels adapts to the target feature shape
     model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth,
                   num_heads=num_heads, t_injection=t_injection).to(device)
+    # Warm-start: initialise from an existing LatCH checkpoint (e.g. our best head)
+    # so diversity training starts at a known-good basin and the divergence penalty
+    # drives the new weights toward a different mode.
+    if warm_start and diversity_ref:
+        from stable_audio_tools.models.latch import load_latch_from_checkpoint
+        print(f"Warm-start: initializing weights from {diversity_ref}")
+        warm = load_latch_from_checkpoint(diversity_ref, device=str(device))
+        try:
+            model.load_state_dict(warm.state_dict(), strict=True)
+            print("  Warm-start state_dict loaded (strict).")
+        except Exception as e:
+            missing = model.load_state_dict(warm.state_dict(), strict=False)
+            print(f"  Warm-start state_dict loaded (non-strict): {missing}")
+        del warm
     raw_model = model  # uncompiled handle — used for state_dict() to keep checkpoints prefix-free
     print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads}, t_injection={t_injection} "
           f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
@@ -423,6 +443,29 @@ def train(
     huber_beta = locals().get("huber_beta")  # None unless regression branch set it
     std_mean = locals().get("std_mean")      # None unless standardize (regression only)
     std_std = locals().get("std_std")
+
+    # Diversity loss wrapper: if a --diversity-ref is given, the criterion is
+    # wrapped to add -λ · clamp(MSE(pred, ref(z,t)), max=bound) — penalises
+    # being too similar to the reference, encouraging a different basin.
+    if diversity_ref:
+        from stable_audio_tools.training.diversity_loss import (
+            DiversityLoss, load_reference_head,
+        )
+        print(f"Diversity loss: reference={diversity_ref}, "
+              f"lambda_div={lambda_div}, warmup_steps={div_warmup_steps}, "
+              f"mse_bound={div_mse_bound}")
+        ref_head = load_reference_head(diversity_ref, device=device)
+        criterion = DiversityLoss(
+            base_criterion=criterion,
+            ref_head=ref_head,
+            lambda_div=float(lambda_div),
+            warmup_steps=int(div_warmup_steps),
+            mse_bound=float(div_mse_bound),
+            use_standardized=(std_mean is not None),
+            std_mean=float(std_mean or 0.0),
+            std_std=float(std_std or 1.0),
+        )
+        loss_type = f"{loss_type}+diversity"
 
     def _std_t(tgt):
         """Standardize a target tensor (identity unless --standardize on a regression head)."""
@@ -639,6 +682,11 @@ def train(
             
             optimizer.zero_grad()
             
+            # Diversity loss needs (z_t, t) to forward the reference head.
+            # Other criteria ignore this; set_context is a no-op on them.
+            if getattr(criterion, "wants_context", False):
+                criterion.set_context(z=z_t, t=t)
+
             with torch.cuda.amp.autocast():
                 # Predict controls directly from noisy latent `z_t`
                 preds = model(z_t, t)
@@ -848,6 +896,29 @@ if __name__ == "__main__":
                              "rel_max, abs_max). 0 = disabled. Useful with --hot-dtype "
                              "fp16/bf16 to verify quantisation isn't destabilising. Cost: "
                              "~0.5%% at N=200.")
+    # Diversity training
+    parser.add_argument("--diversity-ref", type=str, default=None,
+                        help="Path to a LatCH checkpoint to use as a frozen reference. "
+                             "Adds a penalty -lambda_div * MSE(pred, ref_pred) to the loss, "
+                             "rewarding divergence from the reference. Used for "
+                             "diversity-incentivised training (paint a 'palette' of "
+                             "qualitatively different heads for the same feature).")
+    parser.add_argument("--lambda-div", type=float, default=None,
+                        help="Weight on the diversity penalty (default 0.3). "
+                             "Higher = push harder away from the reference.")
+    parser.add_argument("--div-warmup-steps", type=int, default=None,
+                        help="Linear ramp lambda_div from 0 to target over this many "
+                             "training steps. Useful for fresh-init runs (let the task "
+                             "loss find something coherent first). 0 = no warmup (use "
+                             "this for warm-start runs where the initial MSE is ~0).")
+    parser.add_argument("--div-mse-bound", type=float, default=None,
+                        help="Cap on MSE(pred, ref_pred) before negating. Prevents the "
+                             "divergence term from running away. Pick relative to the "
+                             "feature's natural variance. Default 100.")
+    parser.add_argument("--warm-start", action="store_true",
+                        help="Initialise the new head's weights from --diversity-ref. "
+                             "Combined with diversity penalty, the head starts at a "
+                             "known-good basin and drifts toward a different mode.")
     parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
@@ -921,4 +992,10 @@ if __name__ == "__main__":
         hot_dtype=pick(args.hot_dtype, "hot_dtype", "fp32"),
         components=pick(args.components, "components", None),
         fp32_audit_period=pick(args.fp32_audit_period, "fp32_audit_period", 0),
+        # Diversity training
+        diversity_ref=pick(args.diversity_ref, "diversity_ref", None),
+        lambda_div=pick(args.lambda_div, "lambda_div", 0.3),
+        div_warmup_steps=pick(args.div_warmup_steps, "div_warmup_steps", 0),
+        div_mse_bound=pick(args.div_mse_bound, "div_mse_bound", 100.0),
+        warm_start=args.warm_start or bool(ycfg.get("warm_start", False)),
     )
