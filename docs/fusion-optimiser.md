@@ -16,13 +16,13 @@ All the building blocks are real, recently-published optimisers. The novelty in 
 |---|---|---|
 | **Muon** | Newton-Schulz quintic orthogonalisation of the gradient update on 2D weights; provides a spectral-norm bound on the update direction. | Keller Jordan, [github.com/KellerJordan/Muon](https://github.com/KellerJordan/Muon). |
 | **NorMuon** | Per-neuron row-norm normalisation after NS5 to fix the uneven-row-magnitude artefact of fixed-iteration NS. | [arXiv:2510.05491](https://arxiv.org/abs/2510.05491). |
-| **MONA** | EMA of gradient differences injected into momentum as a cheap proxy for second-order curvature; deflects updates away from sharp minima. | Claimed in `docs/ideas/optimiser_ideas` as a May 2026 release; I haven't independently located the paper. |
-| **KL-Shampoo** | Two-sided Kronecker-factored covariance preconditioner with KL-divergence-based SPD estimation. | Claimed in `docs/ideas/optimiser_ideas` (late 2025); also not independently located. |
+| **MONA** | EMA of gradient differences injected into momentum as a cheap proxy for second-order curvature; deflects updates away from sharp minima. | **Provenance suspect.** The only "MONA" paper I can locate is a DeepMind AI-safety paper ("Myopic Optimization with Non-myopic Approval", Farquhar et al., Jan 2025) that has nothing to do with optimisers. The "Muon + Nesterov" optimiser in `docs/ideas/optimiser_ideas` may be a name collision or fabrication; the per-component bake-off below also shows it *worsens* pure Muon, consistent with the math being speculative. |
+| **KL-Shampoo** | Two-sided Kronecker-factored covariance preconditioner with KL-divergence-based SPD estimation, eliminating Adam-grafting overhead. | [arXiv:2509.03378](https://arxiv.org/abs/2509.03378) — *Understanding and Improving Shampoo and SOAP via Kullback-Leibler Minimization* (Wu Lin et al., September 2025). |
 | **Schedule-Free** | Anytime-stopping framework: gradients evaluated at an interpolated point y_t = (1−β)·z_t + β·x_t, weights deployed from the averaged iterate x_t. | Defazio et al., [`schedulefree`](https://github.com/facebookresearch/schedule_free) PyPI package. |
-| **ScheduleFree+** | Adds Polyak step size (γ_base · loss_ema / gnorm_ema) on top of Schedule-Free for fully LR-free training. | Claimed in `docs/ideas/optimiser_ideas` (May 2026); not independently located. |
+| **ScheduleFree+** | Adds Polyak step size (γ_base · loss_ema / gnorm_ema) on top of Schedule-Free for fully LR-free training. | [arXiv:2605.19095](https://arxiv.org/abs/2605.19095) — *Scaling Learning-Rate-Free & Schedule-Free Learning to Large Language Models* (Aaron Defazio, May 2026). |
 | **SF-NorMuon** | Combines Schedule-Free averaging with NorMuon spectral updates, with weight decay on the **fast iterate** z_t (not the averaged x_t) for long-horizon stability. | [arXiv:2605.23061](https://arxiv.org/abs/2605.23061). |
 
-The doubt I flagged in the spec about "May 2026" provenance was mostly unwarranted: SF-NorMuon and NorMuon are confirmed published. MONA, ScheduleFree+, and KL-Shampoo I still haven't located specific papers for; the math in FusionOpt is my interpretation of the description in your ideas doc.
+Of the seven inspirations, six are confirmed published. Only **MONA's provenance is suspect** — and conveniently, MONA is also the one component the bake-off rules out (it underperforms pure Muon as a standalone and isn't part of the SF-NorMuon shipping target). The composition that we ended up wanting to ship is entirely backed by published recipes.
 
 ## The formula
 
