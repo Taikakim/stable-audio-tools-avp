@@ -1,0 +1,68 @@
+# LatCH rhythmic-DENSITY bake-off config.
+#
+# Trains a CONTINUOUS density head from a sparse marker feature (onsets/beats) by
+# smoothing the marker train into an envelope (see scripts/latch_dataset.py).
+# Smoothing routes the feature to a regression loss (SmoothL1) instead of BCE, and
+# `--standardize` puts every kind in unit-variance space so their val losses are
+# directly COMPARABLE — that's how we pick the best smoothing.
+#
+# Bake-off: 4 epochs on 30% of the data (seeded, deterministic), one run per kind.
+# Compare the printed `val_median` (lower = the latent explains more of that target):
+#
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind gaussian      --tag dens_gauss3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind linear        --tag dens_lin3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind lowpass       --tag dens_lp3
+#   python scripts/train_latch.py --config latch_train_density.yaml \
+#       --smooth-kind beat_weighted --tag dens_beatw3
+#
+# Then retrain the winner full-data / 30 epochs (drop subset_frac, bump epochs, new --tag).
+
+feature: onsets_activations     # dense markers smooth best (probe: raw 0.10 -> gaussian 0.34)
+objective: rectified_flow
+standardize: true               # REQUIRED for a fair cross-kind comparison
+smooth_kind: gaussian           # overridden per run with --smooth-kind
+smooth_width: 3.0               # ~140 ms; the probe sweet spot
+subset_frac: 0.3                # quick bake-off on a deterministic 30% subset
+subset_seed: 0
+
+epochs: 4
+lr: 3.0e-4
+batch_size: 64
+num_workers: 10
+val_frac: 0.05                  # a touch larger so val_median is stable on the subset
+tag: dens_gauss3                # overridden per run with --tag
+save_dir: latch_weights
+latent_dir: /run/media/kim/Lehto/latents
+
+# ROCm/AMD env: deferred to rocm_env.yaml's `training` profile (single source of
+# truth). train_latch.py applies it before importing torch when no `amd:` section
+# is present here — keeps this config version-agnostic (no stale tunings path).
+
+wandb: true
+wandb_project: latch
+tensorboard: false
+
+# Test-inference DISABLED for the bake-off: it only needs val_median to pick a
+# smoothing kind, and the VAE decode currently crashes in MIOpen under the fresh
+# ROCm/torch-2.10 build (stale 7.2.3/miopen cache → GemmFwdRest solver assertion).
+# A/B the winner by ear in the gradio UI, or re-enable this block once MIOpen is
+# sorted. (Was: kind=constant, target_value [0.05, 0.5], gain 8, weight 10.)
+#
+# test:
+#   model_config: models/checkpoints/small/base_model_config.json
+#   ckpt_path:    models/checkpoints/small/base_model.ckpt
+#   every_epochs: 4
+#   steps: 20
+#   prompt: "techno groove, drums and percussion, snappy kick, hats"
+#   seed: 42
+#   cfg_scale: 3.0
+#   kind: constant
+#   target_value: [0.05, 0.5]
+#   window: [0.4, 1.0]
+#   gain: 8.0
+#   gamma: 0.3
+#   n_iter: 6
+#   weight: 10.0

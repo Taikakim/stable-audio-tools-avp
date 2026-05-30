@@ -6,7 +6,7 @@
 # both BEFORE `import torch`. Values use setdefault, so anything you export in
 # the shell still wins. Override the file location with SAT_ROCM_ENV_YAML.
 
-tunings_root: /home/kim/pytorch-tunings-7.2.2
+tunings_root: /home/kim/pytorch-tunings-7.2.3
 
 # Applied in every profile.
 common:
@@ -22,13 +22,14 @@ common:
   MIOPEN_CUSTOM_CACHE_DIR: "${tunings_root}/miopen/cache"
   MIOPEN_USER_DB_PATH: "${tunings_root}/miopen/db"
   OMP_NUM_THREADS: "8"
+  TRITON_PRINT_AUTOTUNING: "1"
 
 profiles:
-  # Short startup, read-only GEMM cache — for the gradio UI / generation.
+  # Fast MIOpen lookup — for the gradio UI / generation.
   inference:
     MIOPEN_FIND_MODE: "2"            # FAST
-    PYTORCH_TUNABLEOP_TUNING: "0"    # read existing CSV, don't tune
-  # Long runs — best steady-state perf, tune & persist GEMMs.
+    PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss + write CSV
+  # Long runs — best steady-state perf.
   training:
     MIOPEN_FIND_MODE: "6"            # TRUST_VERIFY
-    PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss, write CSV
+    PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss + write CSV

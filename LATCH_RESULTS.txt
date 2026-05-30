@@ -1,0 +1,386 @@
+================================================================================
+LatCH EXPERIMENT RESULTS  —  consolidated 2026-05-27
+================================================================================
+Hardware: AMD RX 9070 XT (gfx1201, RDNA4), ROCm 7.2.3, torch 2.10.0.
+Base head unless noted: onset-density (feature=onsets_activations, gaussian smoothing
+sigma=3, standardized), dim 256, depth 6, batch 64, rectified_flow schedule.
+Data: 202k Goa-trance latent crops; "subset 0.3" = deterministic 60k-crop train pool.
+Metric: val_median of the per-frame loss on a held-out split (lower = better).
+  - "shared holdout" = a FIXED 5% of the full population (seed 12345), identical across
+    runs -> val_median directly comparable. Otherwise a 2% in-subset random val.
+CAVEATS: most runs taken under GPU power-cap 250W + CPU powersave + a concurrent MIR
+  CPU job, so it/s / timing are indicative, not clean. val_median (quality) is
+  unaffected by contention. One overnight matrix was corrupted by a mid-run system
+  sleep (suspend/resume garbled the GPU) and was rerun clean — see notes.
+
+
+================================================================================
+1.  SMOOTHING ENCODABILITY PROBE  (cheap linear ridge, pre-training)
+================================================================================
+Question: are sparse binary marker trains decodable from the latent, and does
+smoothing them into a continuous envelope help? (frame-wise ridge, ctx +-4 frames)
+
+  feature            raw (binary)   gaussian sigma=3
+  beat_activations   R^2 ~0.03      R^2 ~0.20      (still only moderate)
+  onsets_activations R^2 ~0.10-0.16 R^2 ~0.33-0.34 (the viable rhythmic-density signal)
+
+CONCLUSION: raw binary beats are ~undecodable (that's why the beat head was dead);
+smoothing multiplies decodability 3-8x. onsets smooth best -> onset-density is the
+rhythmic control to train.
+
+
+================================================================================
+2.  SMOOTHING-KIND BAKE-OFF  (onset-density, 4 ep, 30% subset, standardized)
+================================================================================
+All standardized so val_median is comparable across kinds.
+
+  kind              val_median
+  gaussian sigma3   0.1906   <-- WINNER
+  linear sigma3     0.2246
+  lowpass sigma3    0.2379
+  beat_weighted     0.2521   <-- WORST (on-beat weighting made the target HARDER)
+
+CONCLUSION: plain gaussian density wins; the on-beat-weighted "pulse clarity" idea
+hurt. (4-epoch numbers; absolute values higher than converged runs below.)
+
+
+================================================================================
+3.  HEAD WIDTH — QUALITY  (30 ep, batch 64, shared holdout)
+================================================================================
+  dim    params   val_median
+  256    4.9M     0.1596   <-- BEST
+  512    19.3M    0.1827
+  768    43.4M    0.2089
+  1024   76.9M    0.2291
+
+CONCLUSION: dim 256 wins; wider is monotonically WORSE (higher train loss too =
+under-optimizing at LR 3e-4/30ep, not overfitting). The task doesn't need >4.9M params.
+NOTE: a 10-epoch snapshot had falsely shown 512>256 (premature convergence).
+
+
+================================================================================
+4.  BATCH-SIZE SWEEP  (dim 256, doubling 1 -> 512)
+================================================================================
+  batch   it/s    items/s   VRAM(GB)
+   1      176.5     177      0.32
+   2      182.0     364      0.33
+   4      198.5     794      0.37
+   8      149.9    1199      0.44
+  16      104.1    1666      0.56
+  32       65.3    2089      0.83
+  64       40.0    2559      1.37   <-- peak items/s (sweet spot)
+  128      19.5    2501      2.47
+  256       9.2    2358      4.58
+  512       4.5    2295      9.12
+
+CONCLUSION: hard ~5 ms/step overhead floor (batch 1-4 all ~180 it/s). Throughput peaks
+at batch ~64, then DECLINES slightly with more VRAM. batch 64 (current) is optimal;
+bigger only for gradient-noise reasons, not speed.
+
+
+================================================================================
+5.  dim x batch THROUGHPUT GRID  (items/s)
+================================================================================
+  dim    params   b1     b4     b16    b64    b256
+  256    4.9M     164    594    1703   2615   2363
+  512    19.3M    132    410    897    1110   1016
+  768    43.4M    80     247    502    612    613
+  1024   76.9M    52     160    333    388    OOM
+  1536   172.8M   26     82     167    208    OOM
+
+(it/s @ b64: 256->40.9, 512->17.3, 768->9.6, 1024->6.1, 1536->3.3)
+CONCLUSION: items/s rises to batch ~64 at EVERY width (no "small batch for wide heads"
+shortcut); wide heads OOM past ~b64-128. Growing dim costs throughput ~with FLOPs
+(256->512 halves it) — not free.
+
+
+================================================================================
+6.  OPTIMIZER / LR / SCHEDULER MATRIX  (onset-density, dim256, batch64, shared holdout)
+================================================================================
+   #  optimizer       LR      epochs/sched   val_median
+   1  schedule-free   3e-4    60ep           0.1461   <-- best (needs the long run)
+   2  Prodigy         (free)  30ep           0.1486   <-- best value (LR-free, no sched)
+   3  Prodigy         (free)  60ep cosine    0.1497
+   4  AdamW           3e-4    30ep           0.1534   (current default)
+   5  AdamW           1e-4    30ep           0.1563
+   6  Lion            3e-5    30ep           0.1738
+   7  Adam 8-bit      3e-4    30ep           0.1785
+   8  schedule-free   3e-4    30ep           0.1826   (SF needs more steps)
+   9  AdamW           1e-3    60ep cosine    0.1864   (cosine RESCUES the too-high LR)
+  10  AdamW           3e-4    60ep cosine    0.1901   (cosine HURTS the good LR)
+  11  Lion            1e-4    30ep           0.2139
+  12  AdamW           1e-3    30ep           0.2190
+  13  Lion            1e-4    60ep cosine    0.2409
+  14  schedule-free   1e-3    30ep           0.2414
+
+CONCLUSION: top 4 within ~5%. Prodigy (LR-free) = set-and-forget winner; schedule-free
+@60ep edges it but costs 2x epochs + is LR-sensitive. Cosine doesn't help good configs
+(only rescues too-high LR); 8-bit Adam costs accuracy; Lion finicky (wants <=3e-5).
+Checkpoints: latch_weights/latch_onsets_activations_optm_*_best.pt
+
+
+================================================================================
+7.  hpcp HARMONY HEAD  (12-bin chroma, cosine loss)
+================================================================================
+  run                         val (cosine-distance)   note
+  stopped @ 1ep (full data)   0.1378                  killed (slow CPU/dataloader)
+  completed 30ep (subset 0.3) 0.0549  -> ~0.945 cosine sim   latch_hpcp_v2_best.pt
+
+CONCLUSION: strong harmony head (~0.945 cosine similarity on held-out chroma).
+To USE it: chroma_major/chroma_minor target kind, value = root pitch class (0=C..11=B).
+
+
+================================================================================
+8.  STANDARDIZED RETRAINS  (30 ep) — recovery of low-variance regression heads
+================================================================================
+  feature             val_median
+  spectral_flatness   0.0986   (recovered; standardization fix holds at 30ep)
+  spectral_skewness   0.1184   (recovered; still falling at ep30 -> more epochs help)
+
+
+================================================================================
+9.  BEAT-ACTIVATIONS HEAD — closed-loop verification (NOT a usable control)
+================================================================================
+Waveform L2 diff (same seed) when guiding beat target to 90 vs 150 BPM, 5 prompts:
+  base->g90 / base->g150 : dL2 0.06 - 0.19
+  g90 <-> g150           : ~same magnitude (opposite targets DON'T diverge)
+  reference: two different SEEDS = dL2 ~1.48 ("completely different audio")
+
+CONCLUSION: beat guidance moves the output only ~5-13% of the seed-scale, and ignores
+the target BPM ("detected BPM shifts" were tracker noise). NOT a usable tempo control —
+do tempo via a native bpm conditioner, not this head.
+
+
+================================================================================
+KEY TAKEAWAYS
+================================================================================
+* Onset-DENSITY (gaussian sigma3) is the viable rhythmic control; beat-activations is not.
+* Head: dim 256 / batch 64 is optimal — don't scale (wider = slower AND worse).
+* Optimizer: Prodigy (LR-free) or AdamW 3e-4; cosine/Lion/8-bit don't help. Spread ~5%.
+* New trained controls awaiting a by-ear / closed-loop check: onset-density + hpcp-chroma.
+* Trust waveform-diff + ears over a feature extractor's headline number (beat-tracker lesson).
+* Don't trust training runs that spanned a system suspend/resume.
+================================================================================
+
+
+================================================================================
+10.  WALL-CLOCK SPEED  (measured from training logs; 250W cap + MIR contention)
+================================================================================
+it/s and s/epoch are reliable; total = epochs x s/epoch (preload +~15-30s one-time,
+negligible). Batch 64 throughout -> items/s = it/s x 64.
+
+OPTIMIZER (dim256, b64, 30ep) — speed COST at fixed shape:
+  optimizer       val_median   it/s   s/epoch   ~30ep wall
+  AdamW 3e-4       0.1534       38.4    23s      ~11.5 min   <- fastest
+  AdamW 1e-4       0.1563       38.3    23s      ~11.5 min
+  schedule-free    0.1826       36.9    24s      ~12   min   (val is 30ep; wants 60)
+  Lion 3e-5        0.1738       35.2    25s      ~12.5 min
+  Adam 8-bit       0.1785       33.9    26s      ~13   min   (slower AND worse)
+  Prodigy          0.1486       28.8    31s      ~15.5 min   (best quality, slowest: +35%)
+
+LONG RUNS (60ep):
+  schedule-free 60ep   0.1461   36.8    24s   ~24 min   (best overall, 2x time)
+  Prodigy cosine 60ep  0.1497   27.6    32s   ~32 min
+  AdamW 3e-4 cos60     0.1901   36.4    24s   ~24 min   (cosine didn't help)
+
+WIDTH (30ep, b64) — real it/s matches synthetic latch_shape_bench.py within a few %:
+  dim    it/s   s/epoch   ~30ep wall
+  256    38.4    23s      ~11.5 min
+  512    16.9    53s      ~26.5 min
+  768     9.4    95s      ~47.5 min
+  1024    6.1   148s      ~74   min
+
+SPEED TAKEAWAY: AdamW 3e-4 = best speed/quality balance (~0.153 in ~11.5 min).
+Prodigy's ~3% quality edge costs ~35% more wall time; 8-bit Adam is slower AND worse;
+schedule-free is nearly AdamW-fast but needs 60ep for its 0.146 win. Width cost scales
+~with FLOPs (256->1024 is ~6.5x slower). Per-step rates validated vs the synthetic
+throughput bench (agree within a few %), so the bench is a trustworthy predictor.
+================================================================================
+
+
+================================================================================
+11.  LION LR SENSITIVITY  (30ep, dim256, shared holdout) — Discord tip confirmed
+================================================================================
+  LR     val_median
+  1e-4   0.2139
+  3e-5   0.1738
+  1e-5   0.1460   <-- sweet spot; TIES schedule-free@60 (0.1461) for best overall
+  3e-6   0.1773   (too low — going below 1e-5 hurts; confirms the optimum)
+
+CONCLUSION: Lion is U-shaped and very LR-sensitive — a 10x miss either side of 1e-5
+costs ~20-50%. At 1e-5 it matches the best quality in the matrix at 30ep/~13 min
+(half schedule-free's epochs). Lion @ 1e-5 is now a top recommendation alongside
+AdamW 3e-4 and Prodigy.
+
+
+================================================================================
+12.  ENERGY / POWER  (from WandB system metrics: system.gpu.0.powerWatts)
+================================================================================
+Energy = gap-clipped trapezoid integral of power over active time. 250W cap on ALL
+runs EXCEPT the lion-low-LR runs (ran ~308W uncapped) -> their Wh isn't 1:1.
+
+  config              val_med  ep  active   meanW  energy_Wh
+  lion_lr1e-5         0.1460   30  12.5m    308     64.0   (uncapped; ~50-55Wh cap-adj)
+  schedule-free 60ep  0.1461   60  25.5m    210     89.3
+  Prodigy             0.1486   30  16.0m    235     62.4
+  AdamW 3e-4          0.1534   30  12.0m    250     50.0   <-- best quality-per-joule
+  Lion 3e-5           0.1738   30  13.2m    239     52.6
+  Adam 8-bit          0.1785   30  13.8m    202     46.3
+  schedule-free 30ep  0.1826   30  12.5m    210     43.6
+  AdamW 1e-3 cos60    0.1864   60  27.0m    212     95.5
+  AdamW 3e-4 cos60    0.1901   60  26.2m    207     90.5
+
+CONCLUSION:
+* Power tracks COMPUTE-DENSITY: dim256 heads draw 210-250W (under the cap); only big
+  dims (1024/1536) would bind the 250W cap. Startup boost + TunableOp tuning spikes to
+  277-310W for ~30s then settles (the "decreasing curve").
+* AdamW 3e-4 = best quality-per-joule (0.153 @ 50 Wh). Beating it costs disproportionate
+  energy: Prodigy +24% Wh for ~3% quality; schedule-free@60 +78% Wh for ~5%.
+* Lion 1e-5 (cap-adjusted ~50-55 Wh) is the efficiency FRONTIER: tied-best quality at
+  ~AdamW energy + time. (Confirm with a capped rerun for a true 1:1 Wh.)
+* TunableOp tuning affects SPEED/energy (front-loaded burst, ~20-30% faster steady) but
+  NOT val_median. Power scales with optimizer compute-density: AdamW (fused fp32) highest,
+  schedule-free / 8-bit (memory-bound steps) lowest.
+================================================================================
+
+
+================================================================================
+13.  POWER-CAP EFFICIENCY + SEED VARIANCE  (2026-05-28)
+================================================================================
+ISO-QUALITY CAP STUDY (Lion 1e-5, SAME config; only the GPU power cap differs ->
+quality identical, isolates the cap's effect on speed/energy):
+  cap          mean W  max W   wall     energy
+  uncapped     308     363    12.5m    64.0 Wh
+  250 W        244     324    12.7m    51.8 Wh
+  ----------------------------------------------
+  delta        -21%    -11%   +1.6%    -19%      perf/watt +24%
+
+* Capping 308->250 W cut ENERGY 19% for a 1.6% TIME penalty — near-free. The top
+  ~64 W of boost bought ~1.6% speed (deep in the inefficient end of the V/F curve).
+* UTILIZATION-DEPENDENT (key caveat): this holds because the dim256 head is OVERHEAD/
+  dataloader-bound — the GPU has slack and draws <cap naturally. A COMPUTE-BOUND load
+  (big dims, or image/audio generation INFERENCE) saturates the GPU, so there the cap
+  bites ~proportionally. Cap cost = f(GPU utilization), NOT a universal constant.
+  [212 W floor sweep pending; should also test a compute-bound config for the contrast.]
+
+SEED VARIANCE — single-run val_median is NOT reliable for FINE ranking:
+* Lion 1e-5 gave 0.1460 vs 0.2003 for the SAME config (unseeded training) — a 0.054
+  swing, LARGER than the entire top-4 optimizer spread (0.146-0.153). So the fine
+  ranking (AdamW3e4 / Prodigy / Lion1e5 / schedfree) was within the noise floor.
+* FIX: train_latch.py now has --seed (verified: same seed -> identical val_median;
+  GPU nondeterminism negligible). 3-seed runs (in progress) give honest error bars.
+* ROBUST regardless of variance: all energy/power/speed findings (config-level), and
+  the COARSE tiers (top group ~0.15 vs bad-LR ~0.21). Only the within-5% order is noisy.
+================================================================================
+
+
+================================================================================
+14.  VARIANCE vs DATA  (the punchline) — AdamW 3e-4, 3 seeds each, 250W
+================================================================================
+                  seeds (best val_median)        mean     std      range
+  subset 0.3 (60k)   0.239 / 0.165 / 0.176       0.1935   0.0323   0.073
+  subset 0.6 (115k)  0.153 / 0.172 / 0.170       0.1650   0.0087   0.019
+
+* Doubling the data: variance -3.7x (std 0.032->0.009) AND quality +15% (0.194->0.165).
+* The "unlucky" seed 0 went 0.239 (worst @0.3) -> 0.153 (BEST @0.6) — more data rescued it.
+* => The large seed-variance was a SMALL-DATA ARTIFACT, not intrinsic. The 30% subset
+  (chosen for fast iteration) cost ~15% quality + ~4x variance.
+
+CONCLUSION (session punchline): the bottleneck was DATA QUANTITY, not optimizer / LR /
+architecture / smoothing. Train production heads on >=60% (ideally full) data; reserve
+the 30% subset for COARSE screening only (its variance can't resolve fine differences).
+At >=0.6 data the std (~0.009) is small enough that optimizer differences MIGHT re-emerge
+above noise — but AdamW 3e-4 remains the cheap default. [Full-data 1.0 point now in §15.]
+================================================================================
+
+
+================================================================================
+15.  NOISE SWEEP — full cross-seed variance characterization (2026-05-28)
+================================================================================
+Cleanest n=10 noise estimate (full-data shootout) + converged 3-seed comparisons.
+
+[A] 10-SEED SHOOTOUT  (full data, AdamW 3e-4, 3 epochs, 250W cap)
+   seed     ep1     ep2     ep3    best
+      0  0.2031  0.1923  0.1900  0.1900
+      1  0.1700  0.1751  0.1721  0.1700   <- best seed (winner at EVERY epoch)
+      2  0.2632  0.2565  0.2611  0.2565   <- worst seed
+      3  0.1899  0.1928  0.1850  0.1850
+      4  0.1832  0.1761  0.1753  0.1753
+      5  0.2014  0.1973  0.1917  0.1917
+      6  0.2452  0.2293  0.2231  0.2231
+      7  0.2173  0.2097  0.2082  0.2082
+      8  0.1911  0.1869  0.1843  0.1843
+      9  0.2555  0.2363  0.2331  0.2331
+
+   ep3 stats: n=10  mean=0.2024  median=0.191  std=0.0272  min=0.172  max=0.261  range=0.089
+
+   Ranked by ep3 (best -> worst):
+     seed  1 (0.172)   4 (0.175)   8 (0.184)   3 (0.185)   0 (0.190)
+     seed  5 (0.192)   7 (0.208)   6 (0.223)   9 (0.233)   2 (0.261)
+
+[B] CROSS-SEED STD vs DATA FRACTION  (AdamW 3e-4, converged 30ep)
+   subset 0.3 (60k)   n=3   mean=0.194   std=0.0323   range=0.073
+   subset 0.6 (115k)  n=3   mean=0.165   std=0.0087   range=0.019   <- 3.7x tighter
+   subset 1.0 (192k)  n=1   best=0.166   (b8lfghdgc seed 0; no multi-seed std yet at 30ep)
+
+[C] CROSS-SEED STD across OPTIMIZERS  (subset 0.3, 30ep)
+   AdamW 3e-4    n=3   mean=0.194  std=0.0323
+   Lion 1e-5     n=3   mean=0.187  std=0.0306
+   Prodigy 1.0   n=3   mean=0.189  std=0.0311
+   -> all optimizers statistically INDISTINGUISHABLE at the 30%-subset noise floor.
+
+CONCLUSIONS
+-----------
+* Shootout std 0.027 is inflated by under-training (3 epochs only); the converged
+  subset-0.6 std (0.009) is the realistic floor at 30ep with multi-seed.
+* SEED DOMINATES EVERYTHING: best-vs-worst seed at full data ~0.089 — bigger than any
+  optimizer / LR / scheduler / smoothing effect we measured.
+* Best-seed pick is RELIABLE FROM EPOCH 1: seed 1 won at ep1, ep2, and ep3 in the
+  shootout. So a 3-epoch shootout reliably identifies the seed for ship-quality runs.
+* Ship-head recipe: full data + 40 ep + AdamW 3e-4 + shootout-winner seed (1 here) +
+  --save-best-only (now also saves _last.pt for the final-epoch checkpoint).
+* `train_latch.py --seed N` is bit-reproducible (same seed -> identical val_median);
+  GPU GEMM atomics nondeterminism is negligible for this workload.
+================================================================================
+
+
+================================================================================
+16.  REPRODUCIBILITY + POWER-CAP THROUGHPUT  (full-data seed-1 retest, 2026-05-28)
+================================================================================
+Same exact command (AdamW 3e-4, full data, 3 ep, seed 1, dim256/b64, RAM preload),
+run three times under DIFFERENT cap + CPU-governor settings to test determinism at
+full-data scale and quantify the cap/CPU effect on an overhead-bound head.
+
+DETERMINISM — val_median per epoch (bit-identical to 6 decimals):
+   ep    250W / powersave    350W / adaptive    212W / adaptive
+    1       0.170000            0.170000           0.170000
+    2       0.175100            0.175100           0.175100
+    3       0.172100            0.172100           0.172100
+
+  -> `--seed N` is BIT-REPRODUCIBLE at full-data scale, ACROSS cap and CPU-governor
+     changes. ROCm GEMM atomics + TunableOp kernel selection do not introduce visible
+     nondeterminism. Seeded runs do not need repeats for reproducibility validation.
+
+CAP / CPU vs THROUGHPUT  (overhead-bound dim256 head):
+  cap     governor      avg it/s    vs baseline      s/epoch
+  250W    powersave      36.51      baseline           82
+  350W    adaptive       39.27       +7.5%             76
+  212W    adaptive       36.80       +0.8%             81   <— 38W LESS cap, ~free
+
+  * Going UP 100W (250->350W) + better CPU governor = only +7.5% it/s.
+  * Going DOWN 38W (250->212W, WITH adaptive CPU) = +0.8% (basically free).
+  * Going DOWN 138W from the uncapped peak (350->212W) = ~6% throughput cost.
+  * The CPU governor (powersave -> adaptive) contributes a meaningful share — possibly
+    more than the cap differences within this range — on this CPU-launch-bound workload.
+
+PERF/WATT — for the sustainability brief:
+  * 212W cap caps PEAK power at ~212W (vs ~244W mean / ~310W uncapped peak at 250W cap)
+    while costing <1% throughput vs the 250W+powersave baseline.
+  * Versus uncapped 350W: 212W is -138W peak for ~6% time penalty — exceptional perf/watt.
+  * 212W is therefore the EFFICIENT OPERATING POINT for overhead-bound LatCH training.
+    Reserve the GPU power budget for COMPUTE-BOUND workloads (gen inference, big-dim
+    heads) where the cap actually binds — those will benefit far more from the headroom.
+
+(Confirms the §13 finding: cap cost = f(GPU utilization). On overhead-bound dim256, even
+aggressive capping is near-free. On compute-bound workloads, the cap would bite.)
+================================================================================

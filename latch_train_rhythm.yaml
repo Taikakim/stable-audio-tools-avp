@@ -1,9 +1,8 @@
-# LatCH training config for tonic_strength (0-1 feature).
-# Same pipeline as latch_train.yaml; only the feature and the test-inference
-# targets differ (dB/ramp_up makes no sense for a [0,1] key-strength feature).
-# Run: python scripts/train_latch.py --config latch_train_tonic_strength.yaml
+# LatCH training config for rhythm features (beat/downbeat/onsets activations).
+# Loss auto-selects bce_logits; test uses beat_grid with BPM targets.
+# Run: python scripts/train_latch.py --config latch_train_rhythm.yaml --feature beat_activations
 
-feature: tonic_strength
+feature: beat_activations      # overridden per run with --feature
 objective: rectified_flow
 epochs: 30
 lr: 3.0e-4
@@ -25,15 +24,15 @@ tensorboard: false
 test:
   model_config: models/checkpoints/small/base_model_config.json
   ckpt_path:    models/checkpoints/small/base_model.ckpt
-  every_epochs: 5             # tonic_strength is weaker-control; test less often
+  every_epochs: 5
   steps: 50
   prompt: "trippy 124BPM acid techno, dry snappy kick and bassline, korg, roland, impactful, modular, eurorack, aggressive, syncopated"
   seed: 42
   cfg_scale: 3.0
-  kind: constant              # steady key-strength target (no ramp)
-  target_value: [0.4, 0.6, 0.8]  # tonic_strength is in [0,1] (measured p1 0.38 / p99 0.83)
+  kind: beat_grid             # target value = BPM; places beat activations on the grid
+  target_value: [90, 124, 160]  # BPM bracket -> one test clip per tempo
   window: [0.4, 1.0]
   gain: 8.0
   gamma: 0.3
   n_iter: 6
-  weight: 1.0
+  weight: 5.0

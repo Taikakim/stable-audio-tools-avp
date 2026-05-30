@@ -693,13 +693,13 @@ def create_sampling_ui(model_config):
 
                 latch_enable_checkbox = gr.Checkbox(label="Enable LatCH (Overrides Sampler)", value=False)
                 with gr.Row():
-                    latch_rho_slider     = gr.Slider(minimum=0.0, maximum=30.0, step=0.1,
+                    latch_rho_slider     = gr.Slider(minimum=0.0, maximum=300.0, step=0.1,
                                                      value=1.0, label="Variance ρ")
-                    latch_mu_slider      = gr.Slider(minimum=0.0, maximum=30.0, step=0.1,
+                    latch_mu_slider      = gr.Slider(minimum=0.0, maximum=300.0, step=0.1,
                                                      value=1.0, label="Mean μ")
-                    latch_gamma_slider   = gr.Slider(minimum=0.0, maximum=2.0, step=0.05,
+                    latch_gamma_slider   = gr.Slider(minimum=0.0, maximum=20.0, step=0.05,
                                                      value=0.3, label="Noise γ")
-                    latch_n_iter_slider  = gr.Slider(minimum=1, maximum=8, step=1,
+                    latch_n_iter_slider  = gr.Slider(minimum=1, maximum=80, step=1,
                                                      value=4, label="Mean iters")
                     latch_log_checkbox   = gr.Checkbox(label="Log gradient norms", value=False)
 
@@ -707,12 +707,12 @@ def create_sampling_ui(model_config):
                 with gr.Row():
                     latch_model_1_dropdown = gr.Dropdown(l_models, label="Model", value="none")
                     latch_kind_1_dropdown  = gr.Dropdown(
-                        ["constant", "ramp_up", "ramp_down", "beat_grid"],
+                        ["constant", "ramp_up", "ramp_down", "beat_grid", "chroma_major", "chroma_minor"],
                         label="Target kind", value="constant")
                 with gr.Row():
                     latch_target_1_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
                                                       value=1.0, label="Target value")
-                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=50.0, step=0.1,
+                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=500.0, step=0.1,
                                                       value=1.0, label="Weight")
                 with gr.Row():
                     latch_start_1_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
@@ -724,12 +724,12 @@ def create_sampling_ui(model_config):
                 with gr.Row():
                     latch_model_2_dropdown = gr.Dropdown(l_models, label="Model", value="none")
                     latch_kind_2_dropdown  = gr.Dropdown(
-                        ["constant", "ramp_up", "ramp_down", "beat_grid"],
+                        ["constant", "ramp_up", "ramp_down", "beat_grid", "chroma_major", "chroma_minor"],
                         label="Target kind", value="constant")
                 with gr.Row():
                     latch_target_2_slider = gr.Slider(minimum=0.0, maximum=5.0, step=0.05,
                                                       value=1.0, label="Target value")
-                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=50.0, step=0.1,
+                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=500.0, step=0.1,
                                                       value=1.0, label="Weight")
                 with gr.Row():
                     latch_start_2_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
@@ -744,6 +744,10 @@ def create_sampling_ui(model_config):
                     if kind == "beat_grid":
                         # target value is BPM, not the feature value
                         slider_min, slider_max, slider_step, slider_val = 30.0, 240.0, 1.0, 120.0
+                    elif kind in ("chroma_major", "chroma_minor"):
+                        # target value is the ROOT pitch class (0=C, 1=C#, …, 11=B);
+                        # the hpcp head guides toward that key's scale-tone profile
+                        slider_min, slider_max, slider_step, slider_val = 0.0, 11.0, 1.0, 0.0
                     elif md and md.get("slider_min") is not None and md.get("slider_max") is not None:
                         # robust p1/p99 bounds from training (outlier-safe; preferred).
                         # NOTE: slider_scale=="log" (spectral_flatness/kurtosis) still renders

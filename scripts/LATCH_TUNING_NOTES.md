@@ -61,6 +61,13 @@ Small (rectified-flow) model. Read this before training a new feature or chasing
   (see standardization), not missing signal.
 - **Probe encodability BEFORE concluding a feature is uncontrollable**, and before
   spending GPU. The latent decides what's possible, not feature intuition.
+- **Verify with waveform-diff + ears, not a feature extractor's headline number.**
+  For `beat_activations`, librosa reported big "BPM shifts" on audio that the
+  relative-L2 waveform diff showed barely moved (and the same seed read the same
+  BPM across all targets) — the beat tracker octave-guesses on near-identical
+  clips. Measure dL2 vs the *seed-scale* (different seed ≈ 1.48) to see how much
+  the guidance actually changed, and compare opposite targets (g_lo↔g_hi) — if
+  they don't diverge more than each does from baseline, the target is being ignored.
 
 ## Empirical results (2026-05-26)
 
@@ -68,7 +75,7 @@ Small (rectified-flow) model. Read this before training a new feature or chasing
 |---|---|
 | rms_energy_{bass,body,mid,air} | **controllable** (trained, pushed) |
 | spectral_flux (sens ~7.8), spectral_kurtosis | **controllable** (trained, pushed) |
-| beat_activations | **controllable** (sens 0.48) |
+| beat_activations | **NOT usable** — closed-loop (2026-05-26) shows only a small *target-agnostic* perturbation (dL2 0.06–0.19 vs seed-scale 1.48); g90↔g150 don't diverge; "BPM shifts" were tracker noise. Drop it; do tempo via a `bpm` conditioner |
 | spectral_flatness | **recovered via `--standardize`** (sens 0.10→0.42) — was a scale/collapse issue, not missing signal |
 | tonic_strength | collapsed at raw scale; feature only moderately encoded (probe R²~0.34) — retry standardized |
 | spectral_skewness | weak (sens ~0.19) |
