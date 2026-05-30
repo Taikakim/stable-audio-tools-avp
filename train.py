@@ -50,6 +50,27 @@ class ModelConfigEmbedderCallback(pl.Callback):
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         checkpoint["model_config"] = self.model_config
 
+class TunableOpFlushCallback(pl.Callback):
+    """Persist TunableOp tuning results periodically instead of only at clean exit.
+
+    On a GPU that also drives the display, the step-1 TunableOp/Triton tuning storm
+    can hang the display and kill the process mid-tune. Flushing the CSV every N steps
+    means each (even crash-terminated) run keeps the GEMMs it managed to tune, so
+    short `--max-steps` bursts accumulate the tuning across runs until nothing is left
+    to tune. No-op when TunableOp is disabled.
+    """
+    def __init__(self, every=25):
+        self.every = max(1, int(every))
+
+    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
+        if trainer.global_step % self.every != 0:
+            return
+        try:
+            if torch.cuda.tunable.is_enabled():
+                torch.cuda.tunable.write_file()
+        except Exception:
+            pass
+
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     args = get_all_args()
@@ -232,7 +253,7 @@ def main():
         strategy=strategy,
         precision=args.precision,
         accumulate_grad_batches=args.accum_batches,
-        callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback],
+        callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback, TunableOpFlushCallback(every=25)],
         logger=logger,
         log_every_n_steps=1,
         max_epochs=10000000,
