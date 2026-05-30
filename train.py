@@ -236,6 +236,9 @@ def main():
         logger=logger,
         log_every_n_steps=1,
         max_epochs=10000000,
+        max_steps=args.max_steps,  # -1 = unlimited; set small (e.g. 256) for short
+                                   # tuning bursts so TunableOp finishes + writes its CSV
+                                   # without a long GPU-hammering session on a display GPU.
         default_root_dir=args.save_dir,
         gradient_clip_val=args.gradient_clip_val,
         reload_dataloaders_every_n_epochs = 0,

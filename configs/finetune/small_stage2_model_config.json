@@ -8,7 +8,7 @@
         "pretransform": {
             "type": "autoencoder",
             "iterate_batch": true,
-            "model_half": true,
+            "model_half": false,
             "config": {
                 "encoder": {
                     "type": "oobleck",
