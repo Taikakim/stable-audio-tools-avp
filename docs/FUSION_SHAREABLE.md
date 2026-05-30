@@ -32,6 +32,15 @@ load-bearing subset of the full Fusion composition; adding MONA and KL-Shampoo
 on top buys ≤ 1 % quality for ~50 % more wall-clock time. **Skip them by
 default.**
 
+**Caveat for diversity training**: SF-NorMuon is the recipe for *score-driven*
+training. If you're using a diversity penalty (negative-loss component
+rewarding divergence from a reference), use **Full Fusion**
+(`--components ns5,normuon,sf,mona,shampoo`) warm-started from your
+SF-NorMuon checkpoint instead. The KL-Shampoo + MONA components stabilise
+the negative loss term that bare SF-NorMuon (and AdamW) can't handle.
+See the "Findings that may or may not transfer" section + the case-study
+table below for the evidence.
+
 In our case-study (5 M-param control heads), this recipe delivered:
 - **−7 % to −20 % raw-MAE** vs an AdamW baseline at the same wall-clock.
 - **Same it/s** as AdamW after architecture co-tuning (depth shrink).
@@ -353,11 +362,22 @@ Plus the model-forward and block-forward adjustments shown above.
   uniform soup falls into a high-loss ridge. The form of "soup" that
   works for us is Schedule-Free's trajectory averaging (already in SF).
 - **Diversity-incentivised training** (penalise being close to a reference
-  head): tested in case study. Worked with spectral optimisers
-  (SF-NorMuon, Full Fusion), NaN'd with AdamW — AdamW's exponential
-  moving averages can't handle the negative loss component. Warm-start
-  from the reference + Full Fusion produces "drifted but structured"
-  variants, useful for aesthetic-palette deployment.
+  head). Tested in case study; key finding:
+  **the production SF-NorMuon recipe is NOT the right choice for diversity
+  training**. The KL-Shampoo + MONA components dropped from production for
+  cost reasons turn out to be load-bearing stabilisers under a negative
+  magnitude-unbounded loss term. Specifically:
+  - Warm-start from the SF-NorMuon ship head + **Full Fusion** + diversity
+    penalty → "drifted but structured" variant (val_MAE 4.19 vs 3.03
+    reference, deriv-corr 0.33). **Recommended diversity recipe.**
+  - Fresh init + SF-NorMuon + diversity → "alien coherent" (val_MAE 6.04,
+    deriv-corr 0.01 ≈ direction-uncorrelated).
+  - AdamW + diversity (fresh or warm-start) → NaN. Adam's EMA-of-moments
+    can't bound the negative loss component.
+  Two recipes for two purposes: SF-NorMuon for score-driven heads, Full
+  Fusion (warm-started) for parallel "personality variants". The
+  KL-Shampoo + MONA components are load-bearing under adversarial
+  objectives — keep them in the codebase.
 
 ## Provenance
 

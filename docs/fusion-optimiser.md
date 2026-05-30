@@ -33,8 +33,23 @@ optimizer = FusionOpt(
 )
 ```
 
-In our case study (5 M-param adaLN-zero transformer heads), this gave
-**−7 % to −20 % raw MAE** vs an AdamW baseline at the **same wall-clock**
+For **diversity-incentivised** training (penalising similarity to a frozen
+reference head), use the full composition instead — warm-started from your
+SF-NorMuon ship checkpoint:
+
+```bash
+--optimizer fusion --components ns5,normuon,sf,mona,shampoo \
+--hot-dtype bf16 --compile \
+--warm-start --diversity-ref path/to/sf_normuon_ship_head.pt --lambda-div 0.3
+```
+
+The KL-Shampoo + MONA components, dropped from production for cost, turn
+out to be the stabilisers under a *negative magnitude-unbounded* loss term.
+See the [Diversity-incentivised training](#diversity-incentivised-training--and-why-full-fusion-is-the-recipe-here-not-sf-normuon)
+section for the case-study evidence.
+
+In our case study (5 M-param adaLN-zero transformer heads), the production
+recipe gave **−7 % to −20 % raw MAE** vs an AdamW baseline at the **same wall-clock**
 after architecture co-tuning. Other workloads should test the recipe
 applicability section.
 
@@ -265,33 +280,52 @@ In our case study:
 for 33 % inference savings; halving width cost 2.7 %. Width contributes
 squared, depth linear — depth is the cheaper axis.
 
-### Diversity-incentivised training
+### Diversity-incentivised training — and why Full Fusion is the recipe here, not SF-NorMuon
 
-Beyond the score-driven ship retrain, the FusionOpt setup makes
-*diversity training* tractable. By adding a penalty `−λ · MSE(pred, ref_pred)`
-that rewards divergence from a frozen reference model, we get heads that
-solve the same task but represent it differently. Useful when artistic
-diversity matters more than scalar val loss.
+Beyond the score-driven ship retrain, the FusionOpt setup makes *diversity
+training* tractable. By adding a penalty `−λ · MSE(pred, ref_pred)` that
+rewards divergence from a frozen reference model, we get heads that solve
+the same task but represent it differently. Useful when artistic diversity
+matters more than scalar val loss.
 
-In our case study (penalty λ=0.3 against the production ship head):
+**Important: the production SF-NorMuon recipe is NOT the right choice for
+diversity training.** The KL-Shampoo + MONA components — which we drop from
+production for cost reasons (50 % more wall-clock for <1 % score quality) —
+turn out to be load-bearing stabilisers when the loss function includes a
+*negative* magnitude-unbounded term. The case-study result that justifies
+this claim:
+
+In our case study (penalty λ=0.3 against the production SF-NorMuon ship head):
 
 | Variant | val MAE | val deriv-corr | notes |
 |---|---|---|---|
-| Reference (ship) | 3.03 | 0.74 | baseline |
-| Fresh init + SF-NorMuon + diversity | 6.04 | 0.01 | "alien coherent" — coherent but unrelated |
-| Warm-start + Full Fusion + diversity | 4.19 | 0.33 | "drifted" — structure preserved, shifted |
-| AdamW + diversity | NaN | NaN | broken — AdamW can't handle negative loss components |
+| Reference (SF-NorMuon production ship) | 3.03 | 0.74 | baseline |
+| **Warm-start + Full Fusion + diversity** | **4.19** | **0.33** | **"drifted but structured" — recommended diversity recipe** |
+| Fresh init + SF-NorMuon + diversity | 6.04 | 0.01 | "alien coherent" — uncorrelated with target's direction |
+| AdamW + diversity (fresh OR warm) | NaN | NaN | broken — AdamW can't handle negative loss components |
 
-**AdamW + negative loss components = unstable.** The Schedule-Free averaging
-+ NS5 row-scaling combination survives because of its internal magnitude
-clipping; bare AdamW doesn't. The diversity penalty implementation requires
-a spectral optimiser to be stable.
+Reading the table:
 
-The audition listening at our prompts suggests the "drifted" variant
-(warm-start + Full Fusion) does produce qualitatively distinct guidance
-character while remaining musically usable. The "alien coherent" variant
-(fresh init + SFN) tends to push the base generator in surprising
-directions that may or may not be useful depending on the artistic intent.
+- **Warm-start + Full Fusion is the diversity-training winner.** The head
+  keeps recognisable structure (deriv_corr 0.33 — partial correlation with
+  the target's direction) while drifting from the reference (val_MAE 4.19
+  vs 3.03). Musically: it still listens to the same audio cue but expresses
+  its target a few dB sideways. Useful as an aesthetic-palette alternative
+  to the production head.
+- **Fresh init + SF-NorMuon** finds a coherent but unrelated solution
+  (deriv_corr ≈ 0). Predictions are aesthetically uncorrelated with the
+  target's actual direction. May produce timbral surprises, but not a
+  controllable drift of the production behaviour.
+- **AdamW + diversity diverges to NaN** in both fresh-init and warm-start
+  variants. Adam's exponential moving averages can't bound the negative
+  loss component. Schedule-Free averaging + NS5 row-scaling survives because
+  of its internal magnitude clipping.
+
+The practical implication for production: ship with SF-NorMuon for the
+score-driven heads; use **Full Fusion (warm-started from the SF-NorMuon
+ship head) with a diversity penalty** when you want a parallel "personality
+variant". Two recipes for two purposes — the KL-Shampoo + MONA components
+aren't vestigial, they're load-bearing under adversarial objectives.
 
 ## Code shapes
 
