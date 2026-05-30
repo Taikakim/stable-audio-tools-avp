@@ -37,20 +37,37 @@ PARAM_GRAMMAR = [
 
 
 def parse_filename(name: str) -> dict | None:
-    """Parse a single FLAC filename into its parameter dict."""
+    """Parse a single FLAC filename into its parameter dict.
+
+    Supports two filename forms:
+      legacy:  <variant>__<params>.flac                     (single prompt)
+      new:     <variant>__<prompt>__<params>.flac           (multi-prompt)
+
+    Plus the unguided special cases:
+      base.flac                                              -> any variant, no LatCH
+      <variant>__noguidance.flac                             -> per-variant no-LatCH
+    """
     stem = Path(name).stem
     if stem == "base":
-        return {"file": name, "variant": "base", "guided": False}
+        return {"file": name, "variant": "base", "prompt": "goa", "guided": False}
 
     if "__" not in stem:
         return None
-    variant, rest = stem.split("__", 1)
-    if rest == "noguidance":
-        return {"file": name, "variant": variant, "guided": False}
 
-    out = {"file": name, "variant": variant, "guided": True}
-    # Split on underscores between tokens (each token starts with a letter)
-    # e.g.  r2_m1_g50_w4_s00_e100_v-15
+    parts = stem.split("__")
+    if len(parts) == 2:
+        # Legacy 2-token form: <variant>__<rest>. Treat as goa prompt by convention.
+        variant, rest = parts
+        prompt = "goa"
+    elif len(parts) >= 3:
+        variant, prompt, rest = parts[0], parts[1], "__".join(parts[2:])
+    else:
+        return None
+
+    if rest == "noguidance":
+        return {"file": name, "variant": variant, "prompt": prompt, "guided": False}
+
+    out = {"file": name, "variant": variant, "prompt": prompt, "guided": True}
     tokens = rest.split("_")
     for token in tokens:
         for prefix, key, caster in PARAM_GRAMMAR:
@@ -76,19 +93,31 @@ def build():
 
     # Group variants and collect axis values
     variants = sorted({e["variant"] for e in entries})
+    prompts = sorted({e["prompt"] for e in entries})
     axes = {key: sorted({e[key] for e in entries if key in e})
             for _, key, _ in PARAM_GRAMMAR}
 
+    # Optional prompt-tag -> full-text map for the UI's tooltip; written
+    # iff scripts/render_audition.py left a PROMPTS dict alongside us.
+    prompts_dir_index = RENDERS / "prompts.json"
+    prompt_texts = {}
+    if prompts_dir_index.exists():
+        try:
+            prompt_texts = json.loads(prompts_dir_index.read_text())
+        except Exception:
+            prompt_texts = {}
+
     manifest = {
-        "version": 1,
+        "version": 2,
         "render_settings": {
-            "prompt": "Goa trance upbeat song, melancholy, korg, Roland, analog synths",
             "steps": 40,
             "cfg_scale": 7.0,
             "model": "Stable Audio Open Small",
             "seed": 42,
         },
         "variants": variants,
+        "prompts": prompts,
+        "prompt_texts": prompt_texts,
         "axes": axes,
         "entries": entries,
     }

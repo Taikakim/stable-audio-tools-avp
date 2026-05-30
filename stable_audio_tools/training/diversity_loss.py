@@ -105,7 +105,11 @@ class DiversityLoss(nn.Module):
 
         # If no context (e.g. validation), report only the task loss; diversity
         # is a training-time pressure, not a measurement objective.
-        if self._ctx_z is None or self._ctx_t is None:
+        # Also bail when the stashed context doesn't match the current pred's
+        # batch size (e.g. val batch != train batch); that's a sign the criterion
+        # is being called outside its intended training-step context.
+        if (self._ctx_z is None or self._ctx_t is None
+                or self._ctx_z.shape[0] != pred.shape[0]):
             self.last_components = {"L_task": L_task.detach()}
             return L_task
 

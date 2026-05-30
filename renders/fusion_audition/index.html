@@ -90,6 +90,7 @@ audio { height: 28px; min-width: 280px; }
 </div>
 
 <div class="filters">
+  <label>Prompt <select id="f-prompt"><option value="">all</option></select></label>
   <label>Variant <select id="f-variant"><option value="">all</option></select></label>
   <label>ρ (var) <select id="f-rho"><option value="">all</option></select></label>
   <label>μ (mean) <select id="f-mu"><option value="">all</option></select></label>
@@ -101,6 +102,8 @@ audio { height: 28px; min-width: 280px; }
   </label>
   <div class="count" id="count"></div>
 </div>
+
+<div id="prompt-info" class="card" style="font-size: 12.5px; color: var(--muted); padding: 10px 14px; display:none;"></div>
 
 <div class="card" id="results">
   <div class="empty" id="loading">Loading manifest…</div>
@@ -136,6 +139,7 @@ function populateSelect(id, values, formatter = v => String(v)) {
 }
 
 function applyFilters(entries) {
+  const p  = document.getElementById("f-prompt").value;
   const v  = document.getElementById("f-variant").value;
   const r  = document.getElementById("f-rho").value;
   const m  = document.getElementById("f-mu").value;
@@ -144,6 +148,7 @@ function applyFilters(entries) {
   const showBase = document.getElementById("f-base").checked;
   return entries.filter(e => {
     if (!showBase && e.variant === "base") return false;
+    if (p && e.prompt !== p) return false;
     if (v && e.variant !== v) return false;
     if (r && (e.rho == null || String(e.rho) !== r)) return false;
     if (m && (e.mu  == null || String(e.mu)  !== m)) return false;
@@ -232,10 +237,12 @@ async function init() {
 
   // Render settings line
   const rs = DATA.render_settings || {};
+  const promptCount = (DATA.prompts && DATA.prompts.length) || 1;
   document.getElementById("render-settings").textContent =
-    `prompt "${rs.prompt}" @ ${rs.steps} steps, ${rs.model}, seed ${rs.seed}`;
+    `${promptCount} prompt${promptCount > 1 ? "s" : ""} @ ${rs.steps} steps, ${rs.model}, seed ${rs.seed}`;
 
   // Populate filter selects from the axes returned by the manifest
+  if (DATA.prompts && DATA.prompts.length) populateSelect("f-prompt", DATA.prompts);
   populateSelect("f-variant", DATA.variants);
   if (DATA.axes.rho)    populateSelect("f-rho",    DATA.axes.rho);
   if (DATA.axes.mu)     populateSelect("f-mu",     DATA.axes.mu);
@@ -246,10 +253,24 @@ async function init() {
     if (e.start != null && e.end != null) winSet.add(windowLabel(e.start, e.end));
   populateSelect("f-window", Array.from(winSet).sort());
 
-  // Wire filter changes
-  ["f-variant","f-rho","f-mu","f-weight","f-window","f-base"].forEach(id =>
-    document.getElementById(id).addEventListener("change", render));
+  // Tooltip card showing full prompt text when a single prompt is selected.
+  function updatePromptInfo() {
+    const pick = document.getElementById("f-prompt").value;
+    const txt = (DATA.prompt_texts && DATA.prompt_texts[pick]) || "";
+    const info = document.getElementById("prompt-info");
+    if (pick && txt) {
+      info.textContent = `Prompt "${pick}": ${txt}`;
+      info.style.display = "";
+    } else {
+      info.style.display = "none";
+    }
+  }
 
+  // Wire filter changes
+  ["f-prompt","f-variant","f-rho","f-mu","f-weight","f-window","f-base"].forEach(id =>
+    document.getElementById(id).addEventListener("change", () => { updatePromptInfo(); render(); }));
+
+  updatePromptInfo();
   render();
 }
 
