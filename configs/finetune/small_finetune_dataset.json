@@ -1,0 +1,27 @@
+{
+    "_comment": "Pre-encoded latent dataset for SA Open Small finetune. 25% track-level subset, 5% (of subset) track-level val holdout. All metadata for global conditioners comes from the per-crop .json sidecars; no extra extraction needed.",
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "goa_25pct_train",
+            "path": "/run/media/kim/Lehto/latents",
+            "custom_metadata_module": "/home/kim/Projects/SAO/stable-audio-tools/scripts/goa_metadata.py"
+        }
+    ],
+    "latent_extension": "npy",
+    "random_crop": false,
+    "_notes": {
+        "subset_and_holdout": "Track-level split is enforced by scripts/goa_metadata.py via deterministic hashing of the parent-dir track name. Each crop's metadata picks up either include/exclude/val from the same hash so train and val sets are exact complements.",
+        "conditioners_extracted_from_json": [
+            "prompt          (synthesised from track_metadata + genre + key + bpm)",
+            "seconds_total   (from .json: seconds_total)",
+            "bpm             (from .json: bpm — essentia value)",
+            "syncopation     (from .json: syncopation, 0..1)",
+            "on_beat_ratio   (from .json: on_beat_ratio, 0..1)",
+            "rhythmic_complexity (from .json: rhythmic_complexity, 0..1)",
+            "rhythmic_evenness   (from .json: rhythmic_evenness, 0..1)"
+        ],
+        "track_id_extraction": "parent-dir name of the .npy/.json files (e.g. '100th Monkey - Spiritus')",
+        "to_use_a_different_split": "edit GOA_SUBSET_FRAC / GOA_VAL_OF_SUBSET / GOA_SPLIT_SEED at the top of scripts/goa_metadata.py"
+    }
+}

@@ -1,0 +1,280 @@
+{
+    "_comment": "Stage 1: finetune Stable Audio Open Small's rectified-flow base model on the Goa-Trance dataset with new global conditioners (BPM + 4 rhythmic scalars). Identical to models/checkpoints/small/base_model_config.json EXCEPT for: (a) the 5 new NumberConditioners in conditioning.configs, (b) the 5 new ids added to diffusion.global_cond_ids, (c) training.pre_encoded set to true since we feed VAE-encoded latents directly, (d) demo prompts updated to exercise the new conditioners. Pretransform config kept identical \u2014 the encoder is frozen during finetune since the latents are already encoded.",
+    "model_type": "diffusion_cond",
+    "sample_size": 524288,
+    "sample_rate": 44100,
+    "audio_channels": 2,
+    "model": {
+        "pretransform": {
+            "type": "autoencoder",
+            "iterate_batch": true,
+            "model_half": true,
+            "config": {
+                "encoder": {
+                    "type": "oobleck",
+                    "requires_grad": false,
+                    "config": {
+                        "in_channels": 2,
+                        "channels": 128,
+                        "c_mults": [
+                            1,
+                            2,
+                            4,
+                            8,
+                            16
+                        ],
+                        "strides": [
+                            2,
+                            4,
+                            4,
+                            8,
+                            8
+                        ],
+                        "latent_dim": 128,
+                        "use_snake": true
+                    }
+                },
+                "decoder": {
+                    "type": "oobleck",
+                    "config": {
+                        "out_channels": 2,
+                        "channels": 128,
+                        "c_mults": [
+                            1,
+                            2,
+                            4,
+                            8,
+                            16
+                        ],
+                        "strides": [
+                            2,
+                            4,
+                            4,
+                            8,
+                            8
+                        ],
+                        "latent_dim": 64,
+                        "use_snake": true,
+                        "final_tanh": false
+                    }
+                },
+                "bottleneck": {
+                    "type": "vae"
+                },
+                "latent_dim": 64,
+                "downsampling_ratio": 2048,
+                "io_channels": 2
+            },
+            "chunked": true
+        },
+        "conditioning": {
+            "configs": [
+                {
+                    "id": "prompt",
+                    "type": "t5",
+                    "config": {
+                        "t5_model_name": "t5-base",
+                        "max_length": 64
+                    }
+                },
+                {
+                    "id": "seconds_total",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 256
+                    }
+                },
+                {
+                    "id": "bpm",
+                    "type": "number",
+                    "config": {
+                        "min_val": 60,
+                        "max_val": 200
+                    }
+                },
+                {
+                    "id": "syncopation",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 1
+                    }
+                },
+                {
+                    "id": "on_beat_ratio",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 1
+                    }
+                },
+                {
+                    "id": "rhythmic_complexity",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 1
+                    }
+                },
+                {
+                    "id": "rhythmic_evenness",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 1
+                    }
+                }
+            ],
+            "cond_dim": 768
+        },
+        "diffusion": {
+            "cross_attention_cond_ids": [
+                "prompt",
+                "seconds_total"
+            ],
+            "global_cond_ids": [
+                "seconds_total",
+                "bpm",
+                "syncopation",
+                "on_beat_ratio",
+                "rhythmic_complexity",
+                "rhythmic_evenness"
+            ],
+            "diffusion_objective": "rectified_flow",
+            "distribution_shift_options": {
+                "min_length": 256,
+                "max_length": 4096
+            },
+            "type": "dit",
+            "config": {
+                "io_channels": 64,
+                "embed_dim": 1024,
+                "depth": 16,
+                "num_heads": 8,
+                "cond_token_dim": 768,
+                "global_cond_dim": 4608,
+                "transformer_type": "continuous_transformer",
+                "attn_kwargs": {
+                    "qk_norm": "ln"
+                }
+            }
+        },
+        "io_channels": 64
+    },
+    "training": {
+        "use_ema": true,
+        "log_loss_info": false,
+        "pre_encoded": true,
+        "timestep_sampler": "trunc_logit_normal",
+        "optimizer_configs": {
+            "diffusion": {
+                "optimizer": {
+                    "type": "AdamW",
+                    "config": {
+                        "lr": 5e-05,
+                        "betas": [
+                            0.9,
+                            0.95
+                        ],
+                        "eps": 1e-08,
+                        "weight_decay": 0.01,
+                        "foreach": true
+                    }
+                },
+                "scheduler": {
+                    "type": "InverseLR",
+                    "config": {
+                        "inv_gamma": 1000000,
+                        "power": 0.5,
+                        "warmup": 0.995
+                    }
+                }
+            }
+        },
+        "demo": {
+            "demo_every": 250,
+            "demo_steps": 50,
+            "num_demos": 8,
+            "demo_cond": [
+                {
+                    "prompt": "Goa Trance, 140 BPM, minor key, classic uplifting acid lead",
+                    "seconds_total": 11,
+                    "bpm": 140,
+                    "syncopation": 0.4,
+                    "on_beat_ratio": 0.6,
+                    "rhythmic_complexity": 0.5,
+                    "rhythmic_evenness": 0.4
+                },
+                {
+                    "prompt": "Goa Trance, 145 BPM, dark psychedelic, dense bassline",
+                    "seconds_total": 11,
+                    "bpm": 145,
+                    "syncopation": 0.7,
+                    "on_beat_ratio": 0.4,
+                    "rhythmic_complexity": 0.75,
+                    "rhythmic_evenness": 0.3
+                },
+                {
+                    "prompt": "Goa Trance, 132 BPM, melancholy, korg, Roland, analog synths",
+                    "seconds_total": 11,
+                    "bpm": 132,
+                    "syncopation": 0.3,
+                    "on_beat_ratio": 0.7,
+                    "rhythmic_complexity": 0.4,
+                    "rhythmic_evenness": 0.55
+                },
+                {
+                    "prompt": "Goa Trance, 150 BPM, fast forest psy, syncopated",
+                    "seconds_total": 11,
+                    "bpm": 150,
+                    "syncopation": 0.85,
+                    "on_beat_ratio": 0.35,
+                    "rhythmic_complexity": 0.8,
+                    "rhythmic_evenness": 0.25
+                },
+                {
+                    "prompt": "Goa Trance breakdown, atmospheric pad swell, no kick",
+                    "seconds_total": 11,
+                    "bpm": 138,
+                    "syncopation": 0.1,
+                    "on_beat_ratio": 0.2,
+                    "rhythmic_complexity": 0.2,
+                    "rhythmic_evenness": 0.1
+                },
+                {
+                    "prompt": "Goa Trance, 144 BPM, on-the-grid 16th-note acid",
+                    "seconds_total": 11,
+                    "bpm": 144,
+                    "syncopation": 0.15,
+                    "on_beat_ratio": 0.85,
+                    "rhythmic_complexity": 0.6,
+                    "rhythmic_evenness": 0.7
+                },
+                {
+                    "prompt": "Goa Trance intro, 130 BPM, sparse percussion, minor",
+                    "seconds_total": 11,
+                    "bpm": 130,
+                    "syncopation": 0.25,
+                    "on_beat_ratio": 0.55,
+                    "rhythmic_complexity": 0.3,
+                    "rhythmic_evenness": 0.35
+                },
+                {
+                    "prompt": "Goa Trance, 148 BPM, complex polyrhythmic groove",
+                    "seconds_total": 11,
+                    "bpm": 148,
+                    "syncopation": 0.8,
+                    "on_beat_ratio": 0.45,
+                    "rhythmic_complexity": 0.9,
+                    "rhythmic_evenness": 0.4
+                }
+            ],
+            "demo_cfg_scales": [
+                1,
+                4,
+                7
+            ]
+        }
+    }
+}

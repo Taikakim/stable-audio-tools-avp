@@ -10,11 +10,13 @@ tunings_root: /home/kim/pytorch-tunings-7.2.3
 
 # Applied in every profile.
 common:
+
   PYTORCH_TUNABLEOP_ENABLED: "1"
   PYTORCH_TUNABLEOP_VERBOSE: "1"
   PYTORCH_TUNABLEOP_FILENAME: "${tunings_root}/tunableop_results.csv"
   PYTORCH_SDP_KERNEL_VERBOSE: "1"
-  PYTORCH_ALLOC_CONF: "garbage_collection_threshold:0.6,max_split_size_mb:512"
+  # PYTORCH_ALLOC_CONF: "garbage_collection_threshold:0.6,max_split_size_mb:512"
+  PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
   PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
   HIP_FORCE_DEV_KERNARG: "1"
   FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
@@ -39,5 +41,5 @@ profiles:
     PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss + write CSV
   # Long runs — best steady-state perf.
   training:
-    MIOPEN_FIND_MODE: "6"            # TRUST_VERIFY
+    MIOPEN_FIND_MODE: "3"            # TRUST_VERIFY
     PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss + write CSV

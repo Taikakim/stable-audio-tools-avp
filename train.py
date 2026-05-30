@@ -1,6 +1,22 @@
 import matplotlib
 matplotlib.use('Agg')  # headless backend to avoid segfault on ROCm
-import stable_audio_tools.rocm_env  # set HIP/MIOpen/TunableOp env before torch
+
+# Apply the ROCm/AMD *training* profile from rocm_env.yaml BEFORE torch (and before
+# the stable_audio_tools package __init__, which would otherwise apply the
+# *inference* profile). Values use setdefault, so whichever profile runs first
+# wins — we want the training MIOpen find mode + TunableOp tuning for long runs.
+# Loaded standalone via importlib so importing it does not drag in torch.
+def _apply_training_rocm_profile():
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+    _re = _Path(__file__).resolve().parent / "stable_audio_tools" / "rocm_env.py"
+    _spec = _ilu.spec_from_file_location("_sat_rocm_env_training", _re)
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    _m.apply_profile("training", verbose=True)
+_apply_training_rocm_profile()
+
+import stable_audio_tools.rocm_env  # no-op now (training profile already set); kept for clarity
 import torch
 import json
 import os
@@ -81,7 +97,40 @@ def main():
     model = create_model_from_config(model_config)
 
     if args.pretrained_ckpt_path:
-        copy_state_dict(model, load_ckpt_state_dict(args.pretrained_ckpt_path))
+        pretrained_sd = load_ckpt_state_dict(args.pretrained_ckpt_path)
+        copy_state_dict(model, pretrained_sd)
+
+        # AdaLN-zero stability fix for ADDED global conditioners (partial zero-init).
+        # When we append NumberConditioners, the global-conditioning input projection
+        # (to_global_embed.0) grows in width, so copy_state_dict skips it and it stays
+        # RANDOMLY initialised. Two failure modes follow:
+        #   1) A fully-random projection injects an unmodulated signal into every AdaLN
+        #      block of the pretrained DiT and diverges it to NaN within ~2k steps.
+        #   2) Zeroing the WHOLE projection (naive AdaLN-zero) also kills the base
+        #      model's pretrained seconds_total global signal, which is always-on
+        #      (no CFG dropout) precisely so the model doesn't "cheese the loss" by
+        #      generating silence — so that collapses to silent outputs instead.
+        # Correct fix: copy the pretrained block back (seconds_total is global_cond_ids[0],
+        # occupying the first ckpt-width input columns) and zero ONLY the appended
+        # new-conditioner columns. The model then starts IDENTICAL to the base — full
+        # seconds_total conditioning intact, new conditioners contributing nothing —
+        # and the new columns grow in as training learns them.
+        fixed = []
+        for name, param in model.named_parameters():
+            if name.endswith("to_global_embed.0.weight"):
+                ckpt_t = pretrained_sd.get(name)
+                if ckpt_t is None or tuple(ckpt_t.shape) != tuple(param.shape):
+                    with torch.no_grad():
+                        param.zero_()
+                        preserved = 0
+                        if (ckpt_t is not None and ckpt_t.shape[0] == param.shape[0]
+                                and ckpt_t.shape[1] <= param.shape[1]):
+                            param[:, :ckpt_t.shape[1]] = ckpt_t.to(param.dtype, copy=True)
+                            preserved = ckpt_t.shape[1]
+                    fixed.append((name, tuple(param.shape), preserved))
+        for name, shape, preserved in fixed:
+            print(f"[stability] partial zero-init {name} {shape}: preserved first {preserved} "
+                  f"cols (pretrained seconds_total global cond), zeroed the rest (new conditioners)")
 
     if args.remove_pretransform_weight_norm == "pre_load":
         remove_weight_norm_from_model(model.pretransform)
@@ -95,26 +144,44 @@ def main():
 
     training_wrapper = create_training_wrapper_from_config(model_config, model)
 
+    # Optional torch.compile (Inductor) on the DiT network. Opt-in via --compile;
+    # 1st iter pays a graph-build cost, the rest run faster. Inductor FX-graph cache
+    # is persisted across runs by rocm_env.yaml (TORCHINDUCTOR_*). We compile the
+    # innermost transformer so EMA/demo/ARC machinery around it stays untouched.
+    #
+    # Use the in-place nn.Module.compile() (NOT `m = torch.compile(m)`): the latter
+    # wraps the module in an OptimizedModule and injects `_orig_mod.` into every
+    # state_dict key, which would break unwrap_model.py and the Stage-2 ckpt load.
+    # In-place compile leaves the module tree — and therefore checkpoint keys — clean.
+    if getattr(args, "compile", False):
+        mode = getattr(args, "compile_mode", "default") or "default"
+        target = training_wrapper.diffusion.model
+        inner = getattr(target, "model", None)
+        compile_target = inner if inner is not None else target
+        compile_target.compile(mode=mode)
+        what = "DiT inner network" if inner is not None else "DiT wrapper"
+        print(f"torch.compile (in-place): {what} (mode={mode}); 1st iter will be slow.")
+
     exc_callback = ExceptionCallback()
 
     if args.logger == 'wandb':
         logger = pl.loggers.WandbLogger(project=args.name)
         logger.watch(training_wrapper)
-    
+
         if args.save_dir and isinstance(logger.experiment.id, str):
-            checkpoint_dir = os.path.join(args.save_dir, logger.experiment.project, logger.experiment.id, "checkpoints") 
+            checkpoint_dir = os.path.join(args.save_dir, logger.experiment.project, logger.experiment.id, "checkpoints")
         else:
             checkpoint_dir = None
     elif args.logger == 'comet':
         logger = pl.loggers.CometLogger(project_name=args.name)
         if args.save_dir and isinstance(logger.version, str):
-            checkpoint_dir = os.path.join(args.save_dir, logger.name, logger.version, "checkpoints") 
+            checkpoint_dir = os.path.join(args.save_dir, logger.name, logger.version, "checkpoints")
         else:
             checkpoint_dir = args.save_dir if args.save_dir else None
     else:
         logger = None
         checkpoint_dir = args.save_dir if args.save_dir else None
-        
+
     ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
 
@@ -151,7 +218,7 @@ def main():
         strategy = 'ddp_find_unused_parameters_true' if args.num_gpus > 1 else "auto"
 
     val_args = {}
-    
+
     if args.val_every > 0:
         val_args.update({
             "check_val_every_n_epoch": None,
@@ -164,7 +231,7 @@ def main():
         num_nodes = args.num_nodes,
         strategy=strategy,
         precision=args.precision,
-        accumulate_grad_batches=args.accum_batches, 
+        accumulate_grad_batches=args.accum_batches,
         callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback],
         logger=logger,
         log_every_n_steps=1,
@@ -173,7 +240,7 @@ def main():
         gradient_clip_val=args.gradient_clip_val,
         reload_dataloaders_every_n_epochs = 0,
         num_sanity_val_steps=0, # If you need to debug validation, change this line
-        **val_args      
+        **val_args
     )
 
     trainer.fit(training_wrapper, train_dl, val_dl, ckpt_path=args.ckpt_path if args.ckpt_path else None)
