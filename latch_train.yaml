@@ -18,27 +18,43 @@ wandb: true
 wandb_project: latch
 tensorboard: false
 
-# Periodic test inference DISABLED: VAE decode currently crashes in MIOpen when run
-# inside a training process under the fresh ROCm/torch-2.10 build (FIND_MODE=6 +
-# stale cache → GemmFwdRest solver assertion). A/B heads by ear in gradio, or
-# re-enable once MIOpen decode-in-trainer is fixed (clear 7.2.3/miopen cache + retest).
-#
-# test:
-#   model_config: models/checkpoints/small/base_model_config.json
-#   ckpt_path:    models/checkpoints/small/base_model.ckpt
-#   every_epochs: 1
-#   steps: 50
-#   prompt: "trippy 124BPM acid techno, dry snappy kick and bassline, korg, roland, impactful, modular, eurorack, aggressive, syncopated"
-#   seed: 42
-#   cfg_scale: 3.0
-#   kind: ramp_up
-#   target_value: [-50, -30, -10]
-#   window: [0.4, 1.0]
-#   gain: 8.0
-#   gamma: 0.3
-#   n_iter: 6
-#   weight: 1.0
+# Periodic test inference: generate audio with the in-training head as a LatCH guide.
+# Enabled only when model_config + ckpt_path are set. Output: latch_weights/<stem>_test_ep<N>.wav
+# (and logged to W&B as test/audio). Set every_epochs higher to test less often.
+test:
+  model_config: models/checkpoints/small/base_model_config.json   # base diffusion model to guide
+  ckpt_path:    models/checkpoints/small/base_model.ckpt
+  every_epochs: 1             # run a test generation every N epochs
+  steps: 50                   # number of diffusion sampler steps for each test clip
+  prompt: "trippy 124BPM acid techno, dry snappy kick and bassline, korg, roland, impactful, modular, eurorack, aggressive, syncopated"
+  seed: 42                    # fixed seed -> same base clip each epoch, so only guidance changes
+  cfg_scale: 3.0              # classifier-free guidance scale for the base prompt
 
-# ROCm/AMD env: deferred to rocm_env.yaml's `training` profile (single source of
-# truth). train_latch.py applies it before importing torch when no `amd:` section
-# is present here — keeps this config version-agnostic (no stale tunings path).
+  # ---- LatCH guidance hyperparameters (see memory: latch-sigmas-schedule / latch-paper) ----
+  kind: ramp_up               # target envelope shape: constant | ramp_up | ramp_down | beat_grid(BPM)
+  target_value: [-50, -30, -10]  # requested feature level(s); scalar OR bracket -> one clip per value (dB for rms)
+  window: [0.4, 1.0]          # [start_pct, end_pct]; END AT 1.0 — RF guidance power lives in the high-α tail (~80-98%)
+  gain: 8.0                   # sets both rho & mu; overall guidance strength (paper's 0.03 is inaudible here; ~3 clear, ~10 strong)
+  # rho: 5.0                  # (optional) variance-guidance strength on the noisy latent z_t; defaults to gain
+  # mu:  5.0                  # (optional) mean-guidance strength on the clean estimate z_{0|t}; defaults to gain
+  gamma: 0.3                  # input noise augmentation std (smooths the guidance gradient; paper value)
+  n_iter: 6                   # mean-guidance iterations per step (paper=4; higher = stronger, slower)
+  weight: 1.0                 # per-guide loss multiplier (matters when stacking multiple heads)
+
+  # AMD/ROCm environment for this training run — applied BEFORE `import torch`.
+# (The package/inference path uses rocm_env.yaml; this is the training profile.)
+amd:
+  PYTORCH_TUNABLEOP_ENABLED: "1"
+  PYTORCH_TUNABLEOP_TUNING: "1"        # tune & persist GEMMs during the long run
+  PYTORCH_TUNABLEOP_VERBOSE: "1"
+  PYTORCH_TUNABLEOP_FILENAME: /home/kim/pytorch-tunings-7.2.2/tunableop_results.csv
+  PYTORCH_SDP_KERNEL_VERBOSE: "1"
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.6,max_split_size_mb:512
+  PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
+  HIP_FORCE_DEV_KERNARG: "1"
+  MIOPEN_FIND_MODE: "6"                # TRUST_VERIFY — best steady-state for long training
+  MIOPEN_CUSTOM_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/miopen/cache
+  MIOPEN_USER_DB_PATH: /home/kim/pytorch-tunings-7.2.2/miopen/db
+  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+  TRITON_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/triton_cache
+  OMP_NUM_THREADS: "8"

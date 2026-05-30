@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LatCH Fusion Audition</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fafaf8;
+  --card: #ffffff;
+  --ink: #111418;
+  --muted: #5b6470;
+  --line: #e5e7eb;
+  --accent: #c2410c;
+  --accent-soft: #fed7aa;
+  --good: #15803d;
+  --code-bg: #f1f3f5;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d22;
+    --ink: #e6e8eb;
+    --muted: #8a929b;
+    --line: #2a2f36;
+    --code-bg: #232830;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
+h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 13px; margin: 14px 0 6px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+.sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 14px; }
+code, .mono { font-family: var(--mono); font-size: 12px; }
+.filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+  margin-bottom: 14px; padding: 12px 14px; background: var(--card);
+  border: 1px solid var(--line); border-radius: 10px; }
+.filters label { font-size: 11px; color: var(--muted); display: flex;
+  flex-direction: column; gap: 3px; min-width: 80px; text-transform: uppercase;
+  letter-spacing: 0.04em; }
+.filters select, .filters input[type=checkbox] { padding: 4px 8px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+  font-family: inherit; font-size: 13px; color: var(--ink); }
+.filters .count { margin-left: auto; color: var(--muted); font-size: 12px;
+  align-self: center; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; padding: 8px 8px 8px 0; font-weight: 600; color: var(--muted);
+  border-bottom: 1px solid var(--line); white-space: nowrap; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; user-select: none; }
+th:hover { color: var(--accent); }
+th .sort { color: var(--accent); margin-left: 2px; font-size: 9px; }
+td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:hover td { background: rgba(120, 120, 120, 0.04); }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 999px;
+  background: var(--code-bg); color: var(--ink); font-family: var(--mono);
+  font-size: 11px; }
+.pill.base { background: #fde68a; color: #6b3a06; }
+.pill.adamw_a1 { background: #bfdbfe; color: #1e3a8a; }
+.pill.sfnormuon { background: #fed7aa; color: #7c2d12; }
+.pill.fusion_b2 { background: #d8b4fe; color: #581c87; }
+.pill.muon { background: #c7d2fe; color: #312e81; }
+.pill.mona { background: #fbcfe8; color: #831843; }
+.pill.sfplus { background: #d9f99d; color: #3f6212; }
+/* Production ship heads (§21) — saturated greens so they stand out. */
+.pill.ship_sfn_bass { background: #86efac; color: #14532d; font-weight: 600; }
+.pill.ship_ff_bass { background: #5eead4; color: #134e4a; font-weight: 600; }
+.pill.ship_sfn_flatness { background: #6ee7b7; color: #064e3b; font-weight: 600; }
+.pill.ship_sfn_flux { background: #34d399; color: #022c22; font-weight: 600; }
+/* Diversity-trained heads (§23) — magenta family for aesthetic-driven variants. */
+.pill.div_freshSFN_bass { background: #f9a8d4; color: #831843; font-weight: 600; }
+.pill.div_warmFusion_bass { background: #f472b6; color: #500724; font-weight: 600; }
+/* Snapshot ensemble (§24) — graded blues by epoch (later = darker). */
+.pill.snap_bass_ep10 { background: #dbeafe; color: #1e3a8a; }
+.pill.snap_bass_ep15 { background: #bfdbfe; color: #1e3a8a; }
+.pill.snap_bass_ep20 { background: #93c5fd; color: #1e3a8a; }
+.pill.snap_bass_ep25 { background: #60a5fa; color: #1e3a8a; }
+.pill.snap_bass_ep30 { background: #3b82f6; color: white; }
+.pill.snap_flatness_ep10 { background: #e0e7ff; color: #312e81; }
+.pill.snap_flatness_ep15 { background: #c7d2fe; color: #312e81; }
+.pill.snap_flatness_ep20 { background: #a5b4fc; color: #312e81; }
+.pill.snap_flatness_ep25 { background: #818cf8; color: #312e81; }
+.pill.snap_flatness_ep30 { background: #6366f1; color: white; }
+audio { height: 28px; min-width: 280px; }
+.footnote { color: var(--muted); font-size: 11.5px; margin-top: 18px; line-height: 1.55; }
+.kbd { font-family: var(--mono); background: var(--code-bg); padding: 1px 5px;
+  border-radius: 4px; font-size: 11px; border: 1px solid var(--line); }
+.empty { padding: 30px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>LatCH Fusion audition</h1>
+<div class="sub">
+  Generated audio for comparing FusionOpt-trained LatCH heads against each other and an
+  unguided base reference. See <code>docs/fusion-optimiser.md</code> for the design.
+  All clips: <span id="render-settings"></span>.
+</div>
+
+<div class="filters">
+  <label>Prompt <select id="f-prompt"><option value="">all</option></select></label>
+  <label>Variant <select id="f-variant"><option value="">all</option></select></label>
+  <label>ρ (var) <select id="f-rho"><option value="">all</option></select></label>
+  <label>μ (mean) <select id="f-mu"><option value="">all</option></select></label>
+  <label>weight <select id="f-weight"><option value="">all</option></select></label>
+  <label>window <select id="f-window"><option value="">all</option></select></label>
+  <label style="flex-direction: row; gap: 6px; min-width:auto; padding-bottom:5px;">
+    <input type="checkbox" id="f-base" checked>
+    <span style="text-transform: none;">show base.flac</span>
+  </label>
+  <div class="count" id="count"></div>
+</div>
+
+<div id="prompt-info" class="card" style="font-size: 12.5px; color: var(--muted); padding: 10px 14px; display:none;"></div>
+
+<div class="card" id="results">
+  <div class="empty" id="loading">Loading manifest…</div>
+</div>
+
+<div class="footnote">
+  Naming scheme: <code class="kbd">&lt;variant&gt;__r&lt;ρ&gt;_m&lt;μ&gt;_g&lt;γ×100&gt;_w&lt;weight&gt;_s&lt;start%&gt;_e&lt;end%&gt;_v&lt;target&gt;.flac</code>
+  &nbsp;|&nbsp; <code>base.flac</code> = unguided reference.
+  <br>To add new renders: drop FLAC files into <code>renders/fusion_audition/</code>
+  with the scheme above and re-run <code>scripts/build_manifest.py</code> to
+  regenerate the manifest.
+</div>
+
+</div>
+
+<script>
+let DATA = null;
+let SORT = { key: "variant", dir: 1 };
+
+function windowLabel(start, end) {
+  if (start == null || end == null) return "—";
+  return `${(start*100).toFixed(0)}–${(end*100).toFixed(0)}%`;
+}
+
+function populateSelect(id, values, formatter = v => String(v)) {
+  const sel = document.getElementById(id);
+  values.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = String(v);
+    opt.textContent = formatter(v);
+    sel.appendChild(opt);
+  });
+}
+
+function applyFilters(entries) {
+  const p  = document.getElementById("f-prompt").value;
+  const v  = document.getElementById("f-variant").value;
+  const r  = document.getElementById("f-rho").value;
+  const m  = document.getElementById("f-mu").value;
+  const w  = document.getElementById("f-weight").value;
+  const win= document.getElementById("f-window").value;
+  const showBase = document.getElementById("f-base").checked;
+  return entries.filter(e => {
+    if (!showBase && e.variant === "base") return false;
+    if (p && e.prompt !== p) return false;
+    if (v && e.variant !== v) return false;
+    if (r && (e.rho == null || String(e.rho) !== r)) return false;
+    if (m && (e.mu  == null || String(e.mu)  !== m)) return false;
+    if (w && (e.weight == null || String(e.weight) !== w)) return false;
+    if (win) {
+      const label = windowLabel(e.start, e.end);
+      if (label !== win) return false;
+    }
+    return true;
+  });
+}
+
+function sortRows(rows) {
+  const k = SORT.key, d = SORT.dir;
+  return rows.slice().sort((a, b) => {
+    let av = a[k], bv = b[k];
+    if (av == null && bv == null) return 0;
+    if (av == null) return  d;
+    if (bv == null) return -d;
+    if (typeof av === "string") return av.localeCompare(bv) * d;
+    return (av - bv) * d;
+  });
+}
+
+function render() {
+  const rows = sortRows(applyFilters(DATA.entries));
+  document.getElementById("count").textContent = `${rows.length} / ${DATA.entries.length} clips`;
+  const root = document.getElementById("results");
+  if (rows.length === 0) {
+    root.innerHTML = '<div class="empty">No clips match the filters.</div>';
+    return;
+  }
+  let html = '<table><thead><tr>';
+  const cols = [
+    ["variant",  "variant"],
+    ["rho",      "ρ"],
+    ["mu",       "μ"],
+    ["weight",   "weight"],
+    ["window",   "window"],
+    ["value",    "target"],
+    ["file",     "file"],
+    [null,       "audio"],
+  ];
+  for (const [k, label] of cols) {
+    if (k === null) { html += `<th>${label}</th>`; continue; }
+    const arr = (k === SORT.key) ? `<span class="sort">${SORT.dir > 0 ? "▼" : "▲"}</span>` : "";
+    html += `<th data-sort="${k}">${label}${arr}</th>`;
+  }
+  html += '</tr></thead><tbody>';
+  for (const e of rows) {
+    const win = e.guided === false ? "—" : windowLabel(e.start, e.end);
+    html += `<tr>
+      <td><span class="pill ${e.variant}">${e.variant}</span></td>
+      <td class="mono">${e.rho ?? "—"}</td>
+      <td class="mono">${e.mu ?? "—"}</td>
+      <td class="mono">${e.weight ?? "—"}</td>
+      <td class="mono">${win}</td>
+      <td class="mono">${e.value ?? "—"}</td>
+      <td class="mono"><a href="${e.file}" download>${e.file}</a></td>
+      <td><audio controls preload="none" src="${e.file}"></audio></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  root.innerHTML = html;
+
+  // Wire up sort headers
+  root.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const k = th.dataset.sort;
+      if (SORT.key === k) SORT.dir *= -1;
+      else { SORT.key = k; SORT.dir = 1; }
+      render();
+    });
+  });
+}
+
+async function init() {
+  try {
+    const r = await fetch("manifest.json?_=" + Date.now());
+    DATA = await r.json();
+  } catch (e) {
+    document.getElementById("loading").innerHTML =
+      `Failed to load <code>manifest.json</code>. Run <code>scripts/build_manifest.py</code> first.<br>${e}`;
+    return;
+  }
+
+  // Render settings line
+  const rs = DATA.render_settings || {};
+  const promptCount = (DATA.prompts && DATA.prompts.length) || 1;
+  document.getElementById("render-settings").textContent =
+    `${promptCount} prompt${promptCount > 1 ? "s" : ""} @ ${rs.steps} steps, ${rs.model}, seed ${rs.seed}`;
+
+  // Populate filter selects from the axes returned by the manifest
+  if (DATA.prompts && DATA.prompts.length) populateSelect("f-prompt", DATA.prompts);
+  populateSelect("f-variant", DATA.variants);
+  if (DATA.axes.rho)    populateSelect("f-rho",    DATA.axes.rho);
+  if (DATA.axes.mu)     populateSelect("f-mu",     DATA.axes.mu);
+  if (DATA.axes.weight) populateSelect("f-weight", DATA.axes.weight);
+  // Window labels
+  const winSet = new Set();
+  for (const e of DATA.entries)
+    if (e.start != null && e.end != null) winSet.add(windowLabel(e.start, e.end));
+  populateSelect("f-window", Array.from(winSet).sort());
+
+  // Tooltip card showing full prompt text when a single prompt is selected.
+  function updatePromptInfo() {
+    const pick = document.getElementById("f-prompt").value;
+    const txt = (DATA.prompt_texts && DATA.prompt_texts[pick]) || "";
+    const info = document.getElementById("prompt-info");
+    if (pick && txt) {
+      info.textContent = `Prompt "${pick}": ${txt}`;
+      info.style.display = "";
+    } else {
+      info.style.display = "none";
+    }
+  }
+
+  // Wire filter changes
+  ["f-prompt","f-variant","f-rho","f-mu","f-weight","f-window","f-base"].forEach(id =>
+    document.getElementById(id).addEventListener("change", () => { updatePromptInfo(); render(); }));
+
+  updatePromptInfo();
+  render();
+}
+
+init();
+</script>
+</body>
+</html>

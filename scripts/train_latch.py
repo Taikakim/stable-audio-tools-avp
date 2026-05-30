@@ -175,6 +175,25 @@ def train(
     scheduler="none",
     save_best_only=False,
     seed=0,
+    compile_model=False,
+    compile_mode="default",
+    t_injection="film",
+    # FusionOpt + TemporalShapeLoss (see docs/superpowers/specs/2026-05-29-fusion-optimiser-design.md)
+    loss_name="smoothl1",
+    mona_alpha=0.2,
+    lambda_deriv=1.0,
+    lambda_multi=0.5,
+    curriculum_steps=0,
+    reset_optimizer=False,
+    hot_dtype="fp32",
+    components=None,
+    fp32_audit_period=0,
+    # Diversity training (see stable_audio_tools/training/diversity_loss.py)
+    diversity_ref=None,         # path to a LatCH checkpoint to use as the frozen reference
+    lambda_div=0.3,             # target weight on the diversity penalty
+    div_warmup_steps=0,         # linear ramp for lambda_div over this many steps
+    div_mse_bound=100.0,        # cap on MSE(pred, ref_pred) before negating
+    warm_start=False,           # initialize the new head's weights from `diversity_ref`
 ):
     os.makedirs(save_dir, exist_ok=True)
     # Seed the training RNG (per-step noise t/randn + shuffle/randperm) so runs are
@@ -288,11 +307,33 @@ def train(
         pre_val = _preload_tensors(val_ds, preload, "val")
 
     # Init Model — out_channels adapts to the target feature shape
-    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth, num_heads=num_heads).to(device)
-    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads} "
+    model = LatCH(in_channels=64, out_channels=out_channels, dim=dim, depth=depth,
+                  num_heads=num_heads, t_injection=t_injection).to(device)
+    # Warm-start: initialise from an existing LatCH checkpoint (e.g. our best head)
+    # so diversity training starts at a known-good basin and the divergence penalty
+    # drives the new weights toward a different mode.
+    if warm_start and diversity_ref:
+        from stable_audio_tools.models.latch import load_latch_from_checkpoint
+        print(f"Warm-start: initializing weights from {diversity_ref}")
+        warm = load_latch_from_checkpoint(diversity_ref, device=str(device))
+        try:
+            model.load_state_dict(warm.state_dict(), strict=True)
+            print("  Warm-start state_dict loaded (strict).")
+        except Exception as e:
+            missing = model.load_state_dict(warm.state_dict(), strict=False)
+            print(f"  Warm-start state_dict loaded (non-strict): {missing}")
+        del warm
+    raw_model = model  # uncompiled handle — used for state_dict() to keep checkpoints prefix-free
+    print(f"LatCH head: dim={dim}, depth={depth}, num_heads={num_heads}, t_injection={t_injection} "
           f"({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
+    if compile_model:
+        model = torch.compile(model, mode=compile_mode)
+        print(f"torch.compile: mode={compile_mode} (1st-iter warmup will spike)")
     
-    # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree
+    # Optimizer (bracketing experiment): adamw | lion | prodigy | adam8bit | schedulefree | fusion
+    _is_fusion = optimizer_name == "fusion"
+    # SF .train()/.eval() toggling: needed for schedulefree, and for fusion only when
+    # the "sf" component is active. Resolved after the optimizer is built (see below).
     _is_sf = optimizer_name == "schedulefree"
     if optimizer_name == "lion":
         from lion_pytorch import Lion
@@ -310,11 +351,43 @@ def train(
         # No external LR schedule by design; needs .train()/.eval() toggling (handled below).
         warmup = max(100, int(0.05 * epochs * max(1, n_train // batch_size)))
         optimizer = AdamWScheduleFree(model.parameters(), lr=lr, warmup_steps=warmup)
+    elif optimizer_name == "fusion":
+        # FusionOpt: bifurcated Muon+MONA+KL-Shampoo (spectral) + ScheduleFree-AdamW (scalar)
+        # with shared Polyak step size. Spec §3. --components selects a subset for the
+        # per-component ablation (see LATCH_RESULTS.txt §20).
+        from stable_audio_tools.training.fusion_opt import FusionOpt
+        from stable_audio_tools.training.fusion_groups import (
+            build_fusion_param_groups, summarise_groups,
+        )
+        warmup = max(100, int(0.05 * epochs * max(1, n_train // batch_size)))
+        groups = build_fusion_param_groups(raw_model, spectral_wd=0.01, scalar_wd=0.0)
+        # Parse components string: e.g. "ns5,mona" -> {"ns5", "mona"}; None -> default (all)
+        comps_set = None
+        if components is not None:
+            comps_set = set(s.strip() for s in str(components).split(",") if s.strip())
+        optimizer = FusionOpt(
+            groups,
+            lr=lr,
+            mona_alpha=mona_alpha,
+            warmup_steps=warmup,
+            hot_dtype=hot_dtype,
+            components=comps_set,
+            fp32_audit_period=int(fp32_audit_period or 0),
+        )
+        # SF .train()/.eval() toggle only when the SF averaging component is active
+        _is_sf = optimizer.uses_sf_averaging
+        print("FusionOpt groups:")
+        print(summarise_groups(groups))
+        print(f"FusionOpt components: {sorted(optimizer.components)}  "
+              f"(SF averaging: {optimizer.uses_sf_averaging})")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr)
     sched = None
     if scheduler == "cosine" and not _is_sf:
         sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    if scheduler == "cosine" and _is_fusion:
+        raise ValueError("--scheduler cosine is incompatible with --optimizer fusion "
+                         "(Polyak step is schedule-free)")
     print(f"Optimizer: {optimizer_name} (lr={lr}); "
           f"scheduler: {'none (schedule-free)' if _is_sf else scheduler}")
     
@@ -349,25 +422,78 @@ def train(
         else:
             huber_beta = max(1e-3, round(0.5 * std, 4))
             print(f"Robust loss: SmoothL1 (Huber) beta={huber_beta}")
-        criterion = nn.SmoothL1Loss(beta=huber_beta)
-        loss_type = "smooth_l1"
+        if loss_name == "temporal":
+            # TemporalShapeLoss: L_point + lambda_d * L_deriv + lambda_m * L_multi
+            # See docs/superpowers/specs/2026-05-29-fusion-optimiser-design.md §4
+            from stable_audio_tools.training.temporal_loss import TemporalShapeLoss
+            criterion = TemporalShapeLoss(
+                huber_beta=huber_beta,
+                lambda_deriv=lambda_deriv,
+                lambda_multi=lambda_multi,
+                point_loss="auto",
+                curriculum_steps=curriculum_steps,
+            )
+            loss_type = "temporal_shape"
+            print(f"Temporal-shape loss: lambda_deriv={lambda_deriv}, lambda_multi={lambda_multi}, "
+                  f"curriculum_steps={curriculum_steps}")
+        else:
+            criterion = nn.SmoothL1Loss(beta=huber_beta)
+            loss_type = "smooth_l1"
 
     huber_beta = locals().get("huber_beta")  # None unless regression branch set it
     std_mean = locals().get("std_mean")      # None unless standardize (regression only)
     std_std = locals().get("std_std")
 
+    # Diversity loss wrapper: if a --diversity-ref is given, the criterion is
+    # wrapped to add -λ · clamp(MSE(pred, ref(z,t)), max=bound) — penalises
+    # being too similar to the reference, encouraging a different basin.
+    if diversity_ref:
+        from stable_audio_tools.training.diversity_loss import (
+            DiversityLoss, load_reference_head,
+        )
+        print(f"Diversity loss: reference={diversity_ref}, "
+              f"lambda_div={lambda_div}, warmup_steps={div_warmup_steps}, "
+              f"mse_bound={div_mse_bound}")
+        ref_head = load_reference_head(diversity_ref, device=device)
+        criterion = DiversityLoss(
+            base_criterion=criterion,
+            ref_head=ref_head,
+            lambda_div=float(lambda_div),
+            warmup_steps=int(div_warmup_steps),
+            mse_bound=float(div_mse_bound),
+            use_standardized=(std_mean is not None),
+            std_mean=float(std_mean or 0.0),
+            std_std=float(std_std or 1.0),
+        )
+        loss_type = f"{loss_type}+diversity"
+
     def _std_t(tgt):
         """Standardize a target tensor (identity unless --standardize on a regression head)."""
         return tgt if std_mean is None else (tgt - std_mean) / std_std
 
+    def _unstd_t(pred):
+        """Inverse of _std_t — pred in raw feature units (for diagnostic MAE).
+        Identity when standardize is off."""
+        return pred if std_mean is None else pred * std_std + std_mean
+
     def validate():
-        """Held-out loss with FIXED noise/timesteps so it's comparable across epochs."""
+        """Held-out loss with FIXED noise/timesteps so it's comparable across epochs.
+
+        Returns (val_mean, val_median, diag) where diag is a dict of cross-loss
+        comparable metrics in RAW feature units:
+          - val_point_mae:      mean |pred_raw - target_raw|
+          - val_deriv_corr:     Pearson(diff(pred_raw), diff(target_raw))
+          - val_multiscale_mae: avg over scales of |pool(pred_raw) - pool(target_raw)|
+        """
+        from stable_audio_tools.training.temporal_loss import val_diagnostic_metrics
         model.eval()
         if _is_sf:
             optimizer.eval()    # schedule-free: switch to AVERAGED weights for val + checkpoint
                                 # (left in eval; the next epoch's optimizer.train() resumes)
         vg = torch.Generator(device=device).manual_seed(1234)
         losses = []
+        diag_accum = {"val_point_mae": 0.0, "val_deriv_corr": 0.0,
+                      "val_multiscale_mae": 0.0, "_n": 0}
         def _vbatches():
             if pre_val is not None:
                 Lv, Tv = pre_val
@@ -384,11 +510,27 @@ def train(
                 z = a.view(Bv, 1, 1) * v_lat + s.view(Bv, 1, 1) * torch.randn(
                     v_lat.shape, device=device, generator=vg)
                 with torch.cuda.amp.autocast():
-                    losses.append(criterion(model(z, tv), _std_t(v_tgt)).item())
+                    preds = model(z, tv)
+                    losses.append(criterion(preds, _std_t(v_tgt)).item())
+                # Raw-unit diagnostics for cross-loss comparison
+                try:
+                    diag = val_diagnostic_metrics(_unstd_t(preds), v_tgt)
+                    diag_accum["val_point_mae"] += float(diag["val_point_mae"]) * Bv
+                    diag_accum["val_deriv_corr"] += float(diag["val_deriv_corr"]) * Bv
+                    diag_accum["val_multiscale_mae"] += float(diag["val_multiscale_mae"]) * Bv
+                    diag_accum["_n"] += Bv
+                except Exception:
+                    pass  # diagnostics are best-effort; never block validation
         model.train()
         if not losses:
-            return float("nan"), float("nan")
-        return float(np.mean(losses)), float(np.median(losses))
+            return float("nan"), float("nan"), {}
+        n = max(1, diag_accum["_n"])
+        diag = {
+            "val_point_mae":      diag_accum["val_point_mae"]      / n,
+            "val_deriv_corr":     diag_accum["val_deriv_corr"]     / n,
+            "val_multiscale_mae": diag_accum["val_multiscale_mae"] / n,
+        }
+        return float(np.mean(losses)), float(np.median(losses)), diag
 
     print(f"Starting training on feature: {target_feature} ({n_train} train items).")
 
@@ -540,35 +682,58 @@ def train(
             
             optimizer.zero_grad()
             
+            # Diversity loss needs (z_t, t) to forward the reference head.
+            # Other criteria ignore this; set_context is a no-op on them.
+            if getattr(criterion, "wants_context", False):
+                criterion.set_context(z=z_t, t=t)
+
             with torch.cuda.amp.autocast():
                 # Predict controls directly from noisy latent `z_t`
                 preds = model(z_t, t)
                 loss = criterion(preds, _std_t(targets))
-                
+
             scaler.scale(loss).backward()
+            if _is_fusion:
+                # FusionOpt needs the loss for its Polyak step size (stays on-device)
+                optimizer.set_loss(loss)
             scaler.step(optimizer)
             scaler.update()
-            
+
             total_loss += loss.item()
             global_step += 1
             pbar.set_postfix({'loss': loss.item()})
             if (tb is not None or wb is not None) and global_step % 50 == 0:
-                log_scalars({"train/loss_step": loss.item()}, global_step)
+                step_log = {"train/loss_step": loss.item()}
+                # Component breakdown if TemporalShapeLoss is in use
+                comps = getattr(criterion, "last_components", None)
+                if comps:
+                    for k, v in comps.items():
+                        step_log[f"train/{k}"] = float(v)
+                log_scalars(step_log, global_step)
             
         avg_loss = total_loss / n_batches
-        val_mean, val_median = validate()
+        val_mean, val_median, val_diag = validate()
         print(f"Epoch {epoch+1}: train_avg={avg_loss:.4f}  "
-              f"val_mean={val_mean:.4f}  val_median={val_median:.4f}")
-        log_scalars({"train/avg": avg_loss, "val/mean": val_mean,
-                     "val/median": val_median, "epoch": epoch + 1}, global_step)
+              f"val_mean={val_mean:.4f}  val_median={val_median:.4f}  "
+              f"val_point_mae={val_diag.get('val_point_mae', float('nan')):.4f}  "
+              f"val_deriv_corr={val_diag.get('val_deriv_corr', float('nan')):.4f}")
+        ep_log = {
+            "train/avg": avg_loss, "val/mean": val_mean,
+            "val/median": val_median, "epoch": epoch + 1,
+        }
+        for k, v in val_diag.items():
+            ep_log[f"val/{k}"] = v
+        if _is_fusion:
+            ep_log.update(optimizer.diagnostic_summary())
+        log_scalars(ep_log, global_step)
 
         checkpoint = {
-            "state_dict": model.state_dict(),
+            "state_dict": raw_model.state_dict(),
             "feature_name": target_feature,
             "feature_stats": feature_stats,
             "target_kind_default": target_kind_default,
             "noise_schedule": objective,  # forward-noising convention the head expects
-            "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine
+            "loss_type": loss_type,       # mse | smooth_l1 | bce_logits | cosine | temporal_shape
             "huber_beta": huber_beta,     # SmoothL1 beta (None unless loss_type==smooth_l1)
             "target_clamp": [clamp_min, clamp_max],
             "standardized": std_mean is not None,  # head predicts (x-mean)/std space
@@ -579,11 +744,22 @@ def train(
             "subset_frac": subset_frac,
             "holdout_frac": holdout_frac, # shared fixed holdout used as val (0 = none)
             "dim": dim, "depth": depth, "num_heads": num_heads,
+            "t_injection": t_injection,   # 'concat' (legacy, T=257) | 'film' (T=256, FA-aligned)
             "optimizer": optimizer_name, "scheduler": scheduler, "lr": lr, "seed": seed,
+            "loss_name": loss_name,       # smoothl1 | temporal
+            "fusion_config": {
+                "mona_alpha": mona_alpha, "lambda_deriv": lambda_deriv,
+                "lambda_multi": lambda_multi, "curriculum_steps": curriculum_steps,
+            } if _is_fusion else None,
             **slider,                     # slider_min / slider_max (p1/p99) + slider_scale (linear|log)
             "val_mean": val_mean,
             "val_median": val_median,
+            **{f"val_{k}": v for k, v in val_diag.items()},  # raw-unit diagnostics
         }
+        # FusionOpt: the SF averaged iterate x_t is the deployable model; the live z_t
+        # is in raw_model.state_dict() above and saved alongside for resume.
+        if _is_fusion:
+            checkpoint["averaged_state_dict"] = optimizer.average_state_dict()
         ep_ckpt = os.path.join(save_dir, f"{stem}_ep{epoch+1}.pt")
         if not save_best_only:            # keep only _best.pt during sweeps (disk)
             torch.save(checkpoint, ep_ckpt)
@@ -677,15 +853,88 @@ if __name__ == "__main__":
     parser.add_argument("--depth", type=int, default=None, help="head transformer depth")
     parser.add_argument("--num-heads", type=int, default=None, help="attention heads")
     parser.add_argument("--optimizer", type=str, default=None,
-                        choices=["adamw", "lion", "prodigy", "adam8bit", "schedulefree"],
+                        choices=["adamw", "lion", "prodigy", "adam8bit", "schedulefree", "fusion"],
                         help="adamw | lion (~3-10x lower LR) | prodigy (LR-free, lr=1.0) | "
-                             "adam8bit (bnb, low-mem) | schedulefree (no LR schedule; .train()/.eval() handled)")
+                             "adam8bit (bnb, low-mem) | schedulefree (no LR schedule; .train()/.eval() handled) | "
+                             "fusion (Muon+MONA+KL-Shampoo+SF+; spec docs/superpowers/specs/2026-05-29-fusion-optimiser-design.md)")
+    parser.add_argument("--loss", type=str, default=None,
+                        choices=["smoothl1", "temporal"],
+                        help="regression loss: smoothl1 (default) | temporal "
+                             "(SmoothL1 + derivative + multi-scale; spec §4). "
+                             "Ignored for hpcp/beat/onset features (use existing branch).")
+    parser.add_argument("--mona-alpha", type=float, default=None,
+                        help="FusionOpt MONA curvature-injection strength (default 0.2). "
+                             "The seed-variance lever; higher = stronger deflection from sharp minima.")
+    parser.add_argument("--lambda-deriv", type=float, default=None,
+                        help="TemporalShapeLoss: weight on the derivative term (default 1.0)")
+    parser.add_argument("--lambda-multi", type=float, default=None,
+                        help="TemporalShapeLoss: weight on the multi-scale L1 term (default 0.5)")
+    parser.add_argument("--curriculum-steps", type=int, default=None,
+                        help="TemporalShapeLoss: linear warmup of lambda_deriv, lambda_multi "
+                             "from 0 to default over this many steps (default 0 = off)")
+    parser.add_argument("--reset-optimizer", action="store_true",
+                        help="when resuming FusionOpt from a legacy AdamW checkpoint, drop "
+                             "the AdamW optimizer state and re-init z_t = x_t = current weights")
+    parser.add_argument("--hot-dtype", type=str, default=None,
+                        choices=["fp32", "fp16", "bf16", "fp16_safe"],
+                        help="FusionOpt spectral hot-path dtype: fp32 (safe, slowest), "
+                             "bf16 (production target, ~1.65x fp32, safe), "
+                             "fp16 (UNSAFE — NS5 quintic overflows, kept for confirmation), "
+                             "fp16_safe (fp16 matmuls with fp32 polynomial accumulation + "
+                             "per-tensor rescale-restore; predicted 1.3-1.5x over bf16). "
+                             "See LATCH_RESULTS.txt §20A,D.")
+    parser.add_argument("--components", type=str, default=None,
+                        help="FusionOpt: comma-separated subset of "
+                             "{mona,shampoo,ns5,normuon,sf}. Default = all (full Fusion). "
+                             "Use 'ns5' for plain Muon, 'mona,ns5' for MONA, "
+                             "'shampoo' for KL-Shampoo only, 'sf' for ScheduleFree+, "
+                             "'ns5,normuon,sf' for SF-NorMuon. See LATCH_RESULTS.txt §20 "
+                             "for the per-component ablation results.")
+    parser.add_argument("--fp32-audit-period", type=int, default=None,
+                        help="FusionOpt: every N steps, recompute NS5 in FP32 alongside "
+                             "the hot-dtype path and log relative-error stats (rel_mean, "
+                             "rel_max, abs_max). 0 = disabled. Useful with --hot-dtype "
+                             "fp16/bf16 to verify quantisation isn't destabilising. Cost: "
+                             "~0.5%% at N=200.")
+    # Diversity training
+    parser.add_argument("--diversity-ref", type=str, default=None,
+                        help="Path to a LatCH checkpoint to use as a frozen reference. "
+                             "Adds a penalty -lambda_div * MSE(pred, ref_pred) to the loss, "
+                             "rewarding divergence from the reference. Used for "
+                             "diversity-incentivised training (paint a 'palette' of "
+                             "qualitatively different heads for the same feature).")
+    parser.add_argument("--lambda-div", type=float, default=None,
+                        help="Weight on the diversity penalty (default 0.3). "
+                             "Higher = push harder away from the reference.")
+    parser.add_argument("--div-warmup-steps", type=int, default=None,
+                        help="Linear ramp lambda_div from 0 to target over this many "
+                             "training steps. Useful for fresh-init runs (let the task "
+                             "loss find something coherent first). 0 = no warmup (use "
+                             "this for warm-start runs where the initial MSE is ~0).")
+    parser.add_argument("--div-mse-bound", type=float, default=None,
+                        help="Cap on MSE(pred, ref_pred) before negating. Prevents the "
+                             "divergence term from running away. Pick relative to the "
+                             "feature's natural variance. Default 100.")
+    parser.add_argument("--warm-start", action="store_true",
+                        help="Initialise the new head's weights from --diversity-ref. "
+                             "Combined with diversity penalty, the head starts at a "
+                             "known-good basin and drifts toward a different mode.")
     parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine"],
                         help="LR schedule: none (constant) | cosine (anneal over --epochs)")
     parser.add_argument("--save-best-only", action="store_true",
                         help="only keep <stem>_best.pt (no per-epoch checkpoints) — for sweeps")
     parser.add_argument("--seed", type=int, default=None,
                         help="training RNG seed (reproducible runs; vary it for seed-variance)")
+    parser.add_argument("--compile", dest="compile_model", action="store_true",
+                        help="wrap the head with torch.compile (Inductor); 1st iter slow, rest faster")
+    parser.add_argument("--compile-mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode (default | reduce-overhead | max-autotune)")
+    parser.add_argument("--t-injection", type=str, default=None,
+                        choices=["concat", "film", "adaln_zero"],
+                        help="timestep injection: 'film' (default, T=256, FA-aligned) | "
+                             "'adaln_zero' (DiT-style per-block, +~50%% params, stronger conditioning) | "
+                             "'concat' (legacy, T=257, prepended timestep token)")
     args = parser.parse_args()
 
     ycfg = {}
@@ -730,4 +979,23 @@ if __name__ == "__main__":
         scheduler=pick(args.scheduler, "scheduler", "none"),
         save_best_only=args.save_best_only or bool(ycfg.get("save_best_only", False)),
         seed=pick(args.seed, "seed", 0),
+        compile_model=args.compile_model or bool(ycfg.get("compile", False)),
+        compile_mode=pick(args.compile_mode, "compile_mode", "default"),
+        t_injection=pick(args.t_injection, "t_injection", "film"),
+        # FusionOpt + TemporalShapeLoss
+        loss_name=pick(args.loss, "loss", "smoothl1"),
+        mona_alpha=pick(args.mona_alpha, "mona_alpha", 0.2),
+        lambda_deriv=pick(args.lambda_deriv, "lambda_deriv", 1.0),
+        lambda_multi=pick(args.lambda_multi, "lambda_multi", 0.5),
+        curriculum_steps=pick(args.curriculum_steps, "curriculum_steps", 0),
+        reset_optimizer=args.reset_optimizer or bool(ycfg.get("reset_optimizer", False)),
+        hot_dtype=pick(args.hot_dtype, "hot_dtype", "fp32"),
+        components=pick(args.components, "components", None),
+        fp32_audit_period=pick(args.fp32_audit_period, "fp32_audit_period", 0),
+        # Diversity training
+        diversity_ref=pick(args.diversity_ref, "diversity_ref", None),
+        lambda_div=pick(args.lambda_div, "lambda_div", 0.3),
+        div_warmup_steps=pick(args.div_warmup_steps, "div_warmup_steps", 0),
+        div_mse_bound=pick(args.div_mse_bound, "div_mse_bound", 100.0),
+        warm_start=args.warm_start or bool(ycfg.get("warm_start", False)),
     )

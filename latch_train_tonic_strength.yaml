@@ -14,9 +14,21 @@ tag: v2
 save_dir: latch_weights
 latent_dir: /run/media/kim/Lehto/latents
 
-# ROCm/AMD env: deferred to rocm_env.yaml's `training` profile (single source of
-# truth). train_latch.py applies it before importing torch when no `amd:` section
-# is present here — keeps this config version-agnostic (no stale tunings path).
+amd:
+  PYTORCH_TUNABLEOP_ENABLED: "1"
+  PYTORCH_TUNABLEOP_TUNING: "1"
+  PYTORCH_TUNABLEOP_VERBOSE: "1"
+  PYTORCH_TUNABLEOP_FILENAME: /home/kim/pytorch-tunings-7.2.2/tunableop_results.csv
+  PYTORCH_SDP_KERNEL_VERBOSE: "1"
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.6,max_split_size_mb:512
+  PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
+  HIP_FORCE_DEV_KERNARG: "1"
+  MIOPEN_FIND_MODE: "6"
+  MIOPEN_CUSTOM_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/miopen/cache
+  MIOPEN_USER_DB_PATH: /home/kim/pytorch-tunings-7.2.2/miopen/db
+  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+  TRITON_CACHE_DIR: /home/kim/pytorch-tunings-7.2.2/triton_cache
+  OMP_NUM_THREADS: "8"
 
 wandb: true
 wandb_project: latch

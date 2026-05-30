@@ -17,9 +17,14 @@ objective: rectified_flow
 epochs: 30
 lr: 3.0e-4
 batch_size: 64
-num_workers: 16          # 24-core box; workers are CPU-bound on msgpack/gzip decompress
+num_workers: 4           # hpcp targets are 12-channel gzip-msgpack blobs (~12x the size
+                         # of 1-channel heads). 16 workers caused SQLite-lock contention
+                         # on the ship retrain (47 min preload at full subset). 4 keeps
+                         # the DB connection happy without starving the GPU.
 subset_frac: 0.3         # 60k crops (Goa-trance is redundant) — stays warm in page cache
-                         # like the density runs, so the GPU stays fed (~37 it/s)
+                         # like the density runs, so the GPU stays fed (~37 it/s).
+                         # Override to 1.0 via CLI for ship retrain; expect ~5 min preload
+                         # at num_workers=4 (vs the broken 47 min at num_workers=16).
 val_frac: 0.02
 tag: v2
 save_dir: latch_weights

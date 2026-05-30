@@ -21,6 +21,14 @@ common:
   TRITON_CACHE_DIR: "${tunings_root}/triton_cache"
   MIOPEN_CUSTOM_CACHE_DIR: "${tunings_root}/miopen/cache"
   MIOPEN_USER_DB_PATH: "${tunings_root}/miopen/db"
+  # torch.compile / Inductor — persistent FX-graph cache across runs (like MIOpen/TunableOp).
+  # Off-by-default at the script level (--compile flag opts in), but cache dir is always set
+  # so compiled graphs are reused once a head opts in.
+  TORCHINDUCTOR_FX_GRAPH_CACHE: "1"
+  TORCHINDUCTOR_CACHE_DIR: "${tunings_root}/inductor_cache"
+  # Triton's AMD backend needs a C compiler for the driver shim. Pin absolute path
+  # so this works regardless of PATH (e.g. minimal sandboxed shells).
+  CC: "/usr/bin/gcc"
   OMP_NUM_THREADS: "8"
   TRITON_PRINT_AUTOTUNING: "1"
 
