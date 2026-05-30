@@ -74,38 +74,38 @@ VARIANTS = [
     {
         "name": "adamw_a1",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_bakeoff_rms_energy_bass_A1_s1_best.pt",
     },
     {
         "name": "sfnormuon",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_components_SFNorMuon_s1_best.pt",
     },
     # Phase-2: production ship heads (§21 — SF-NorMuon + d256/dp4 + bf16)
     {
         "name": "ship_sfn_bass",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_ship_rms_energy_bass_sfn_s1_best.pt",
     },
     {
         "name": "ship_ff_bass",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_ship_rms_energy_bass_fullfusion_s1_best.pt",
     },
     {
         "name": "ship_sfn_flatness",
         "feature": "spectral_flatness",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_spectral_flatness_ship_spectral_flatness_sfn_s1_best.pt",
     },
     {
         "name": "ship_sfn_flux",
         "feature": "spectral_flux",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_spectral_flux_ship_spectral_flux_sfn_s1_best.pt",
     },
     # Phase-3: diversity-trained heads (§23 — train heads explicitly different
@@ -113,13 +113,13 @@ VARIANTS = [
     {
         "name": "div_freshSFN_bass",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_div_A_freshSFN_s1_best.pt",
     },
     {
         "name": "div_warmFusion_bass",
         "feature": "rms_energy_bass",
-        "ckpt": REPO / "latch_weights"
+        "ckpt": REPO / "latch_weights" / "test"
                      / "latch_rms_energy_bass_div_D_warmFusion_s1_best.pt",
     },
 ]
@@ -136,7 +136,7 @@ for feat, tag_prefix, fname_base in [
         VARIANTS.append({
             "name": f"{tag_prefix}_ep{ep}",
             "feature": feat,
-            "ckpt": REPO / "latch_weights" / f"{fname_base}_ep{ep}.pt",
+            "ckpt": REPO / "latch_weights" / "test" / f"{fname_base}_ep{ep}.pt",
         })
 
 # Default target value per feature (mid-range, sane for the prompt).
