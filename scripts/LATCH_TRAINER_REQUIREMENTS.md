@@ -134,6 +134,96 @@ Requirements use the EARS keywords: **ubiquitous** ("shall"), **event-driven**
 
 ---
 
+## 10. Stable Audio 3 portability
+
+Requirements for retargeting the LatCH pipeline from Stable Audio Open Small to
+Stable Audio 3. Grounded in the SA3 paper (flow-matching objective, SAME 256-dim
+latents at ~10.76 Hz, 8-step ping-pong post-training) and SA3's
+`stable_audio_3/inference/sampling.py`. `SA3-*` IDs are kept distinct from `TR-*`
+because they constrain a port, not the current trainer.
+
+### 10.1 Latent geometry
+
+- **SA3-1** The head shall accept SAME latents of **256** input channels (not the
+  64 used for SAO Small); the trainer shall set `in_channels` from the target
+  model's latent dimensionality rather than hard-coding it.
+- **SA3-2** The pipeline shall operate at SA3's SAME frame rate (~10.76 Hz, i.e.
+  4096× downsampling at 44.1 kHz), and shall not assume the SAO Small grid
+  (21.53 Hz, 2048×).
+- **SA3-3** Because the existing `/Lehto/latents` are SAO-Small-VAE latents, the
+  pipeline shall be trained on a corpus **re-encoded through SA3's SAME encoder**
+  (`AutoencoderModel.from_pretrained("same-s"|"same-l")`); SAO latents shall not
+  be reused as SA3 training inputs.
+- **SA3-4** When building a target for a clip of duration `d`, the dataset shall
+  resample the MIR time-series to SA3's frame count `round(d · f_SAME)` rather
+  than to a fixed 256 frames, so target↔latent frame alignment holds at the SA3
+  rate.
+
+### 10.2 Variable length
+
+- **SA3-5** The dataset and target builders shall support variable sequence
+  lengths (SA3 generates up to 380 s), replacing the fixed `max_frames=256`
+  assumption.
+- **SA3-6** Where a batch mixes lengths, the trainer shall mask padded positions
+  out of the loss (consistent with SA3's masked-loss training), rather than
+  padding targets with zeros that contribute to the loss.
+
+### 10.3 Forward-noising / objective
+
+- **SA3-7** Because SA3's flow-matching forward process is the linear
+  interpolation `x_t=(1−t)x₀+t·ε`, the trainer shall forward-noise SA3 heads
+  using the existing `rectified_flow` branch; no new schedule is required.
+- **SA3-8** Because `rectified_flow` and `rf_denoiser` share the same forward
+  interpolation, a single head trained with `--objective rectified_flow` shall be
+  valid for **both** the SA3 base model (Euler) and the SA3 post-trained model
+  (ping-pong); the head's `noise_schedule` metadata shall record this linear
+  family.
+
+### 10.4 Guided sampling — integration constraints
+
+- **SA3-9** Because `sample_diffusion` is decorated `@torch.no_grad()`, the guided
+  sampler shall be implemented as a **separate, gradient-enabled** function and
+  shall not attempt to reuse the no-grad inference path.
+- **SA3-10** When applying variance (ρ) guidance under the Euler sampler, the head
+  shall be queried at the sampler's actual current timestep (`t_curr_tensor`),
+  which `sample_discrete_euler` already exposes per step.
+- **SA3-11** When applying mean (μ) guidance, the guided sampler shall act on the
+  clean estimate `x̂₀ = x − t_curr·v` (the same `denoised` quantity SA3's samplers
+  compute for their callbacks).
+- **SA3-12** The guided sampler shall forward all model conditioning
+  (`cond_inputs`, CFG settings) to the backbone unchanged, so guidance composes
+  with SA3's existing CFG/`batch_cfg` path.
+- **SA3-13** The guided sampler shall support both global `(steps+1,)` and
+  per-element `(batch, steps+1)` schedule tensors, because SA3 emits per-element
+  schedules when `dist_shift` is length-dependent.
+
+### 10.5 Sampler-specific behaviour
+
+- **SA3-14** Where the target is the SA3 **base** model, the guided sampler shall
+  extend the Euler path (50 steps, CFG); the existing back-half / high-α window
+  and `s(t)` weighting carry over because `t` is σ and `α=1−t`.
+- **SA3-15** Where the target is the SA3 **post-trained** model, the guided
+  sampler shall extend the **ping-pong** path: it shall apply guidance to
+  `denoised` **before** the stochastic renoise step
+  (`x=(1−t_next)·denoised+t_next·ε`).
+- **SA3-16** Where only 8 ping-pong steps are available, the guidance window and
+  per-step strength shall be re-derived for that step budget rather than reusing
+  the 50-step bracket; μ-guidance on `x̂₀` is the primary mechanism, with ρ a
+  candidate addition to validate empirically.
+- **SA3-17** Because SA3 warps the schedule via `dist_shift` and uses different
+  samplers per model, the guidance window shall be expressed in **σ-relative**
+  (or logSNR-relative) terms rather than step-index fractions, so it transfers
+  across base/post-trained/SAO without silent dead-zones.
+
+### 10.6 Code location
+
+- **SA3-18** The head trainer, dataset, target builders, and guided sampler shall
+  be ported into the `stable_audio_3` package layout (e.g. alongside
+  `stable_audio_3/inference/sampling.py` and `model.py`), replacing imports of
+  `stable_audio_tools.*`.
+
+---
+
 ## Open questions / assumptions to confirm
 
 1. **Latent/target frame rate** is fixed at 256 frames (~21.53 Hz) for the Small
@@ -147,3 +237,14 @@ Requirements use the EARS keywords: **ubiquitous** ("shall"), **event-driven**
 4. **Legacy checkpoints** — `LATCH_README.md` mentions a `retrofit_latch_stats.py`
    migration; should backward-compatible loading of bare-state-dict files be an
    explicit trainer/inference requirement?
+5. **SA3 target corpus** — re-encoding the training audio through SAME (SA3-3) is
+   the long pole. Do we re-encode the existing Goa corpus, and with SAME-S
+   (matches `small`) or SAME-L (matches `medium`/`large`)? Heads are latent-space
+   specific, so SAME-S and SAME-L likely need separate heads.
+6. **Differential attention gradients** — `medium`/`large` use differential
+   attention and require flash-attn. Does ρ-guidance (which backprops through the
+   DiT) work through that path on the available ROCm build, or is μ-only guidance
+   (no DiT backprop) the safer SA3 default?
+7. **Phase ordering** — confirm Phase 1 targets `small-base` (Euler, the direct
+   SAO analogue) to de-risk the port before attempting ping-pong guidance on the
+   post-trained `small`/`medium`.
