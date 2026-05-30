@@ -1455,3 +1455,92 @@ trade speed for quality.
 If iteration speed matters more than 1-2% quality: d128/dp8 for sweeps.
 
 ================================================================================
+
+
+================================================================================
+23.  DIVERSITY-INCENTIVISED TRAINING  (2026-05-30)
+================================================================================
+Premise (user observation from §20F soup failure): heads at similar val_point_mae
+can describe the same feature differently — different basins of the loss
+landscape. Even though uniform model-soup doesn't work across heterogeneous
+training, the heads DO represent distinct functional solutions.
+
+Question: can we deliberately train heads that DIVERGE from a reference, while
+remaining functionally useful, to build an aesthetic palette of LatCH guides?
+
+EXPERIMENT:
+  Reference (frozen):     ship_sfn_bass    val_point_mae=3.0339 (§21)
+  Penalty:                L_total = L_task - λ·clamp(MSE(pred, ref_pred), max=bound)
+  λ=0.3, bound=100, ramped via linear warmup over 15k steps (fresh init only).
+
+  Cell     init       optimiser           warmup     val_pmae   val_dcorr   status
+  A        fresh      SF-NorMuon + bf16   5 epochs   6.0398     0.0133      converged
+  B        fresh      AdamW               5 epochs   NaN        NaN         diverged
+  C        warm-ref   AdamW               0          NaN        NaN         diverged
+  D        warm-ref   Full Fusion + bf16  0          4.1888     0.3353      converged ← best
+
+KEY FINDINGS:
+
+(1) AdamW + negative loss component = unstable. B and C both NaN'd at
+    epochs 16-18. The diversity term's unbounded negative growth confuses
+    AdamW's exponential moving averages of first/second moments. Spectral
+    optimisers (Muon NS5 + row scaling + SF averaging) survive because
+    NS5 clips spectral norm and row scaling normalises per-neuron
+    magnitudes — both bound the effective gradient size.
+
+(2) Warm-start helps. Cell D's val_pmae=4.19 with deriv_corr=0.33 is
+    qualitatively closer to ship_sfn_bass (3.03 / ~0.74) than fresh-start
+    Cell A (6.04 / 0.01). D's predictions are still STRUCTURED (direction
+    preserved at 0.33 correlation) just shifted away from the reference.
+    A's predictions are essentially uncorrelated with the target's
+    direction (0.01 = noise).
+
+(3) Two flavours of diversity:
+    - Cell A (fresh + diversity): "alien explanation" — coherent prediction
+      that bears little resemblance to a normal bass-energy estimate.
+    - Cell D (warm + diversity): "drift" — recognisably similar to the
+      reference but shifted ~4 dB offset in feature space.
+
+(4) Snapshot ensemble (option 5) costs zero extra training time. Saved
+    all 30 per-epoch checkpoints for bass + flatness; selected ep{10, 15,
+    20, 25, 30} for audition. The 5-snapshot trajectory shows how the
+    head's "character" drifts as training progresses.
+
+WHAT TO LISTEN FOR (in the audition UI):
+
+  - ship_sfn_bass        the well-trained reference (baseline character)
+  - div_warmFusion_bass  same task understood but pushed ~4 dB sideways
+  - div_freshSFN_bass    coherent but aesthetically unrelated solution
+  - snap_bass_ep10..30   character drift as the model trains in
+
+CHECKPOINTS DEPLOYED:
+  latch_weights/latch_rms_energy_bass_div_A_freshSFN_s1_best.pt
+  latch_weights/latch_rms_energy_bass_div_D_warmFusion_s1_best.pt
+  latch_weights/latch_rms_energy_bass_snap_snap_bass_s1_ep{1..30}.pt
+  latch_weights/latch_spectral_flatness_snap_snap_flatness_s1_ep{1..30}.pt
+
+AUDITION:
+  72 new renders at renders/fusion_audition/ — 4 prompts × 19 variants ×
+  1 canonical hparam (rho=8, mu=4, w=8, full window). Compare a variant
+  across prompts to see how the head's character interacts with different
+  audio territory.
+
+  https://github.com/Taikakim/audio-tools-avp/blob/latch-rms-control/renders/fusion_audition/
+
+OPEN QUESTIONS:
+  - Does Cell D's "shifted" character sound musically meaningful, or just
+    "wrong bass energy"? Determined by ear.
+  - Does Cell A's aesthetically-unrelated coherent solution produce
+    interesting timbral effects or just garbled audio?
+  - Snapshot trajectory: is the character drift gradual and continuous,
+    or are there discrete "phases" worth picking out?
+  - Could a smaller λ (0.1 instead of 0.3) on warm-start give a head
+    that's recognisable but subtly different — a "personality variant"
+    rather than a wholesale drift?
+
+OPEN PROBLEMS UNCOVERED:
+  - AdamW + diversity penalty broken. Schedule-Free averaging + spectral
+    clipping is the regularisation that makes the negative-loss-component
+    objective tractable. Generic optimisers without those guards fail.
+
+================================================================================
