@@ -499,6 +499,26 @@ Watch `fusion/gnorm_ema` and `fusion/loss_ema` for stability:
    bf16. Tested fp16 eigendecomp briefly — produced garbage. Cast L, R to
    fp32, decompose, cast back. This is the "fp32 island" pattern.
 
+## Auditioning renders
+
+The comparison pages under `renders/fusion_audition/` and `renders/sweep_audition/`
+are static HTML that load their data with `fetch("manifest.json")`. After dropping
+new FLAC files in (naming scheme is documented in each `index.html`), rebuild the
+manifest and serve over HTTP:
+
+```bash
+sat-venv/bin/python scripts/build_manifest.py     # regenerate manifest.json
+bash scripts/serve_auditions.sh                   # serve at http://localhost:8000
+```
+
+Then open `http://localhost:8000/renders/fusion_audition/index.html`.
+
+> **Do not open `index.html` as a `file://` URL** (double-click). Browsers block
+> `fetch()` of local files, so you'll get `TypeError: Failed to fetch` /
+> "Failed to load manifest.json" even though the manifest built fine. The page must
+> be served over `http://localhost` — that's all `serve_auditions.sh` does
+> (`python -m http.server`, bound to `127.0.0.1`).
+
 ## References
 
 - **SF-NorMuon** — *Anytime Training with Schedule-Free Spectral Optimization*, [arXiv:2605.23061](https://arxiv.org/abs/2605.23061). Load-bearing recipe + WD-on-fast-iterate proof.
